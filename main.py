@@ -4,6 +4,7 @@ import random
 import threading
 import logging
 import re
+import time
 from datetime import datetime
 from functools import wraps
 from flask import Flask, jsonify
@@ -19,6 +20,9 @@ PORT = int(os.environ.get("PORT", 1000))
 
 # ---------- Markdown Escape ----------
 def escape_markdown(text):
+    """Escape Markdown special characters in user input."""
+    if text is None:
+        return ""
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', str(text))
 
@@ -38,9 +42,10 @@ bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 # Temporary data storage for multi-step operations
 temp_data = {}
 
-# ---------- Database Helpers (SQLite) ----------
+# ---------- Database Helpers (SQLite with timeout) ----------
 def get_db_connection():
-    return sqlite3.connect(DB_NAME)
+    """Return a thread-safe SQLite connection with timeout."""
+    return sqlite3.connect(DB_NAME, timeout=10, check_same_thread=False)
 
 def init_db():
     conn = get_db_connection()
@@ -277,25 +282,33 @@ def cmd_start(message):
         if ref != user_id:
             referrer_id = ref
 
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    user = c.fetchone()
-    if not user:
-        c.execute("""INSERT INTO users (user_id, username, full_name, referrer_id)
-                     VALUES (?, ?, ?, ?)""",
-                  (user_id, message.from_user.username, message.from_user.full_name, referrer_id))
-        if referrer_id:
-            reward = float(get_setting("referral_reward"))
-            curr = get_currency()
-            c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (reward, referrer_id))
-            add_transaction(referrer_id, reward, "credit", f"Referral bonus for {user_id}")
-            try:
-                bot.send_message(referrer_id, f"🎉 Someone joined via your link! You got {reward} {curr}")
-            except:
-                pass
-        conn.commit()
-    conn.close()
+    conn = None
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        user = c.fetchone()
+        if not user:
+            c.execute("""INSERT INTO users (user_id, username, full_name, referrer_id)
+                         VALUES (?, ?, ?, ?)""",
+                      (user_id, message.from_user.username, message.from_user.full_name, referrer_id))
+            if referrer_id:
+                reward = float(get_setting("referral_reward"))
+                curr = get_currency()
+                c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (reward, referrer_id))
+                add_transaction(referrer_id, reward, "credit", f"Referral bonus for {user_id}")
+                try:
+                    bot.send_message(referrer_id, f"🎉 Someone joined via your link! You got {reward} {curr}")
+                except:
+                    pass
+            conn.commit()
+    except sqlite3.OperationalError as e:
+        print(f"Database error in start: {e}")
+        bot.reply_to(message, "⚠️ System busy, please try again.")
+        return
+    finally:
+        if conn:
+            conn.close()
 
     if not check_force_join(user_id):
         channel = get_setting("channel_force_join")
@@ -1507,6 +1520,5 @@ if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     logging.basicConfig(level=logging.INFO)
     print("🤖 Bot is polling...")
-    import time
-    time.sleep(5)  # ⏳ পুরনো ইনস্ট্যান্স বন্ধ হওয়ার জন্য অপেক্ষা
+    time.sleep(5)  # Wait for old instance to release (fixes 409 Conflict)
     bot.infinity_polling()
