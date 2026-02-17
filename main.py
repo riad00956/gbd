@@ -8,6 +8,9 @@ import io
 from datetime import datetime, date
 from typing import Optional
 
+from flask import Flask, jsonify
+import threading
+
 import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.client.default import DefaultBotProperties
@@ -35,6 +38,26 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 DB_NAME = "shop_bot.db"
+PORT = int(os.getenv("PORT", 10000))  # Render uses PORT env var
+
+# ---------- Flask App for Health Check ----------
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "running",
+        "bot": "Telegram Shop Bot",
+        "version": "2.0",
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+def run_flask():
+    app.run(host='0.0.0.0', port=PORT)
 
 # ---------- Database Initialization ----------
 async def init_db():
@@ -338,7 +361,7 @@ def admin_panel_kb():
     builder.button(text="🎁 Promos", callback_data="admin_promos")
     builder.button(text="📋 Tasks Mgmt", callback_data="admin_tasks")
     builder.button(text="📦 Orders", callback_data="admin_orders")
-    builder.button(text="📦 Backup DB", callback_data="admin_backup")  # New backup button
+    builder.button(text="📦 Backup DB", callback_data="admin_backup")
     builder.adjust(2)
     return builder.as_markup()
 
@@ -360,6 +383,9 @@ def generate_emoji_captcha():
     seq[missing_index] = "___"
     question = " ".join(seq)
     return question, answer
+
+# ---------- Router ----------
+router = Router()
 
 # ---------- Start & Captcha ----------
 @router.message(CommandStart())
@@ -1442,7 +1468,13 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    print("🤖 Bot is running...")
+    print(f"🤖 Bot is running on port {PORT}...")
+    
+    # Start Flask in a separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # Start bot polling
     await bot.delete_webhook(drop_pending_updates=True)
     try:
         await dp.start_polling(bot)
