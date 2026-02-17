@@ -43,7 +43,7 @@ def home():
     return jsonify({
         "status": "running",
         "bot": "Telegram Shop Bot",
-        "version": "5.0",
+        "version": "6.0",
         "python": "3.10",
         "timestamp": datetime.now().isoformat()
     })
