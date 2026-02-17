@@ -1,9 +1,5 @@
-# নির্দিষ্ট হুইল সংস্করণ উল্লেখ করে (লিনাক্স x86_64-এর জন্য)
-pydantic-core==2.14.6 --find-links https://download.pytorch.org/whl/torch_stable.html
-# অথবা সরাসরি হুইলের লিংক ব্যবহার করে (সঠিক URL খুঁজে বের করে)
-# --index-url https://pypi.org/simple/ ব্যবহার করলেও চলতে পারে
-
-aiogram==3.3.0
-aiosqlite==0.19.0
-python-dotenv==1.0.0
-Flask==2.3.3
+aiogram
+aiosqlite
+python-dotenv
+flask
+gunicorn
