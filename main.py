@@ -3,20 +3,19 @@ import sqlite3
 import random
 import threading
 import logging
-from datetime import datetime, timedelta
+import re
+from datetime import datetime
 from functools import wraps
 from flask import Flask, jsonify
 import telebot
 from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from telebot.handler_backends import State, StatesGroup  # Not fully used but kept for structure
-import re
 
 # ---------- Configuration ----------
-TOKEN = os.getenv("BT")          # Bot token from Render environment
-ADMIN_ID = os.getenv("AD")        # Admin Telegram ID
+TOKEN = os.getenv("BT")
+ADMIN_ID = os.getenv("AD")
 DB_NAME = "shop_bot.db"
-PORT = int(os.environ.get("PORT", 1000))  # Render expects port 1000
+PORT = int(os.environ.get("PORT", 1000))
 
 # ---------- Flask Health Check ----------
 app = Flask(__name__)
@@ -31,37 +30,26 @@ def run_flask():
 # ---------- Bot Initialization ----------
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 
-# Simple state management (user_id -> (state, data))
-user_states = {}
+# Temporary data storage for multi-step operations
+temp_data = {}
 
-def set_state(user_id, state, data=None):
-    user_states[user_id] = {"state": state, "data": data or {}}
-
-def get_state(user_id):
-    return user_states.get(user_id, {"state": None, "data": {}})
-
-def clear_state(user_id):
-    if user_id in user_states:
-        del user_states[user_id]
-
-# ---------- Database Helpers (sqlite3) ----------
+# ---------- Database Helpers ----------
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # Settings table
     c.execute("""CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY, value TEXT
     )""")
     defaults = {
         "welcome_message": "Welcome to our Premium Shop, {name}!",
-        "currency": "$",
+        "currency": "★",
         "support_link": "https://t.me/telegram",
         "rules": "No spamming. Be respectful.",
         "channel_force_join": "",
         "captcha_enabled": "1",
         "shop_enabled": "1",
         "referral_reward": "5.0",
-        "referral_type": "fixed",          # fixed or percent
+        "referral_type": "fixed",
         "daily_reward": "2.0",
         "daily_enabled": "1",
         "scratch_enabled": "1",
@@ -71,7 +59,6 @@ def init_db():
     for key, val in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
 
-    # Users table
     c.execute("""CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -85,7 +72,6 @@ def init_db():
         last_scratch_claim TIMESTAMP
     )""")
 
-    # Transactions table
     c.execute("""CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -95,36 +81,32 @@ def init_db():
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    # Categories table
     c.execute("""CREATE TABLE IF NOT EXISTS categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE
     )""")
 
-    # Products table
     c.execute("""CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         category_id INTEGER,
-        type TEXT,               -- 'digital', 'file', 'manual'
+        type TEXT,
         name TEXT,
         description TEXT,
         price REAL,
-        content TEXT,            -- for digital: text; for file: file_id; for manual: instructions
-        stock INTEGER DEFAULT -1, -- -1 unlimited
+        content TEXT,
+        stock INTEGER DEFAULT -1,
         FOREIGN KEY(category_id) REFERENCES categories(id)
     )""")
 
-    # Orders table
     c.execute("""CREATE TABLE IF NOT EXISTS orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         product_id INTEGER,
-        status TEXT,              -- 'pending', 'delivered', 'cancelled'
-        data TEXT,                -- delivery details
+        status TEXT,
+        data TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    # Tasks table
     c.execute("""CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         description TEXT,
@@ -132,23 +114,20 @@ def init_db():
         reward REAL
     )""")
 
-    # Completed tasks table
     c.execute("""CREATE TABLE IF NOT EXISTS completed_tasks (
         user_id INTEGER,
         task_id INTEGER,
         PRIMARY KEY (user_id, task_id)
     )""")
 
-    # Promos table
     c.execute("""CREATE TABLE IF NOT EXISTS promos (
         code TEXT PRIMARY KEY,
         reward REAL,
         max_usage INTEGER,
         used_count INTEGER DEFAULT 0,
-        expiry_date TEXT          -- ISO format date or empty for no expiry
+        expiry_date TEXT
     )""")
 
-    # Promo usage table
     c.execute("""CREATE TABLE IF NOT EXISTS promo_usage (
         user_id INTEGER,
         code TEXT,
@@ -190,18 +169,18 @@ def add_transaction(user_id, amount, ttype, description):
     conn.commit()
     conn.close()
 
-# ---------- Middleware / Checks ----------
+def get_currency():
+    return get_setting("currency") or "★"
+
+# ---------- Middleware ----------
 def check_force_join(user_id):
     channel = get_setting("channel_force_join")
     if not channel:
         return True
     try:
         member = bot.get_chat_member(channel, user_id)
-        if member.status in ['member', 'administrator', 'creator']:
-            return True
-        return False
+        return member.status in ['member', 'administrator', 'creator']
     except:
-        # Bot not admin or channel invalid - skip check
         return True
 
 def force_join_required(func):
@@ -263,7 +242,8 @@ def admin_panel_kb():
         InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"),
         InlineKeyboardButton("🎁 Promos", callback_data="admin_promos"),
         InlineKeyboardButton("📋 Tasks Mgmt", callback_data="admin_tasks"),
-        InlineKeyboardButton("🗄️ Backup DB", callback_data="admin_backup")
+        InlineKeyboardButton("🗄️ Backup DB", callback_data="admin_backup"),
+        InlineKeyboardButton("🏆 Leaderboard", callback_data="admin_leaderboard")
     ]
     markup.add(*buttons)
     return markup
@@ -281,7 +261,6 @@ def cmd_start(message):
 
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # Check if user exists
     c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     user = c.fetchone()
     if not user:
@@ -290,17 +269,16 @@ def cmd_start(message):
                   (user_id, message.from_user.username, message.from_user.full_name, referrer_id))
         if referrer_id:
             reward = float(get_setting("referral_reward"))
-            currency = get_setting("currency")
+            curr = get_currency()
             c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (reward, referrer_id))
             add_transaction(referrer_id, reward, "credit", f"Referral bonus for {user_id}")
             try:
-                bot.send_message(referrer_id, f"🎉 Someone joined via your link! You got {reward} {currency}")
+                bot.send_message(referrer_id, f"🎉 Someone joined via your link! You got {reward} {curr}")
             except:
                 pass
         conn.commit()
     conn.close()
 
-    # Force join check
     if not check_force_join(user_id):
         channel = get_setting("channel_force_join")
         markup = InlineKeyboardMarkup()
@@ -309,10 +287,8 @@ def cmd_start(message):
         bot.reply_to(message, f"⚠️ You must join our channel {channel} to use this bot.", reply_markup=markup)
         return
 
-    # Captcha
     if get_setting("captcha_enabled") == "1":
         emoji = random.choice(["🐱", "🐶", "🦊", "🐯", "🐼"])
-        set_state(user_id, "captcha", {"emoji": emoji})
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton(emoji, callback_data="captcha_ok"))
         bot.reply_to(message, f"🔒 Security: Click the {emoji} emoji below:", reply_markup=markup)
@@ -330,13 +306,9 @@ def check_joined_callback(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "captcha_ok")
 def captcha_callback(call):
-    state = get_state(call.from_user.id)
-    if state["state"] == "captcha":
-        clear_state(call.from_user.id)
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-        show_welcome(call.message)
-    else:
-        bot.answer_callback_query(call.id, "Invalid session")
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    show_welcome(call.message)
+    bot.answer_callback_query(call.id)
 
 def show_welcome(message):
     user_id = message.from_user.id
@@ -355,14 +327,14 @@ def profile_handler(message):
     if not user:
         bot.reply_to(message, "Please /start first.")
         return
-    currency = get_setting("currency")
+    curr = get_currency()
     bot_info = bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
 
     text = (f"👤 *Profile Details*\n\n"
             f"🆔 ID: `{user_id}`\n"
-            f"💰 Balance: `{user['balance']:.2f} {currency}`\n"
-            f"💸 Total Spent: `{user['total_spent']:.2f} {currency}`\n"
+            f"💰 Points: `{user['balance']:.2f} {curr}`\n"
+            f"💸 Total Spent: `{user['total_spent']:.2f} {curr}`\n"
             f"📅 Joined: {user['joined_at']}\n\n"
             f"🔗 *Referral Link:*\n`{ref_link}`")
 
@@ -388,51 +360,48 @@ def my_transactions(call):
         sign = "+" if r['amount'] > 0 else ""
         text += f"{r['timestamp'][:10]} {r['type']}: {sign}{r['amount']} - {r['description']}\n"
     bot.send_message(call.message.chat.id, text)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "redeem_promo")
 def redeem_promo_start(call):
     msg = bot.send_message(call.message.chat.id, "🎟️ Send me the promo code:")
     bot.register_next_step_handler(msg, process_redeem_promo)
+    bot.answer_callback_query(call.id)
 
 def process_redeem_promo(message):
     code = message.text.strip().upper()
     user_id = message.from_user.id
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # Check promo exists and valid
     c.execute("SELECT * FROM promos WHERE code = ?", (code,))
     promo = c.fetchone()
     if not promo:
         bot.reply_to(message, "❌ Invalid promo code.")
         conn.close()
         return
-    # Check expiry
-    if promo[4]:  # expiry_date
+    if promo[4]:
         exp_date = datetime.fromisoformat(promo[4])
         if datetime.now() > exp_date:
             bot.reply_to(message, "❌ This promo has expired.")
             conn.close()
             return
-    # Check max usage
     if promo[2] != -1 and promo[3] >= promo[2]:
         bot.reply_to(message, "❌ This promo has reached its usage limit.")
         conn.close()
         return
-    # Check if user already used
     c.execute("SELECT * FROM promo_usage WHERE user_id = ? AND code = ?", (user_id, code))
     if c.fetchone():
         bot.reply_to(message, "❌ You have already used this promo.")
         conn.close()
         return
 
-    # Apply reward
     reward = promo[1]
     c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (reward, user_id))
     c.execute("UPDATE promos SET used_count = used_count + 1 WHERE code = ?", (code,))
     c.execute("INSERT INTO promo_usage (user_id, code) VALUES (?, ?)", (user_id, code))
     conn.commit()
     add_transaction(user_id, reward, "credit", f"Promo code: {code}")
-    bot.reply_to(message, f"✅ Promo applied! You received {reward} {get_setting('currency')}.")
+    bot.reply_to(message, f"✅ Promo applied! You received {reward} {get_currency()}.")
     conn.close()
 
 # ---------- Daily Bonus ----------
@@ -461,7 +430,7 @@ def daily_bonus(message):
     conn.commit()
     conn.close()
     add_transaction(user_id, reward, "credit", "Daily Bonus")
-    bot.reply_to(message, f"🎉 You received {reward} {get_setting('currency')} as daily bonus!")
+    bot.reply_to(message, f"🎉 You received {reward} {get_currency()} as daily bonus!")
 
 # ---------- Scratch Card ----------
 @bot.message_handler(func=lambda m: m.text == "✨ Scratch Card")
@@ -490,7 +459,7 @@ def scratch_card(message):
     conn.commit()
     conn.close()
     add_transaction(user_id, win, "credit", "Scratch Card Win")
-    bot.reply_to(message, f"✨ You scratched the card and won `{win:.2f}` {get_setting('currency')}!")
+    bot.reply_to(message, f"✨ You scratched the card and won `{win:.2f}` {get_currency()}!")
 
 # ---------- Tasks ----------
 @bot.message_handler(func=lambda m: m.text == "📋 Tasks")
@@ -537,13 +506,12 @@ def task_callback(call):
         bot.answer_callback_query(call.id, "You already completed this task.")
         conn.close()
         return
-    # Mark as completed and give reward
     c.execute("INSERT INTO completed_tasks (user_id, task_id) VALUES (?, ?)", (user_id, task_id))
     c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (task['reward'], user_id))
     conn.commit()
     add_transaction(user_id, task['reward'], "credit", f"Task: {task['description']}")
-    bot.answer_callback_query(call.id, f"✅ Task completed! You earned {task['reward']} {get_setting('currency')}.")
-    bot.send_message(call.message.chat.id, f"🎉 You completed: {task['description']}\n💰 Reward: {task['reward']} {get_setting('currency')}")
+    bot.answer_callback_query(call.id, f"✅ Task completed! You earned {task['reward']} {get_currency()}.")
+    bot.send_message(call.message.chat.id, f"🎉 You completed: {task['description']}\n💰 Reward: {task['reward']} {get_currency()}")
     conn.close()
 
 # ---------- Support & Rules ----------
@@ -554,8 +522,8 @@ def support(message):
 
 @bot.message_handler(func=lambda m: m.text == "📜 Rules")
 def rules(message):
-    rules = get_setting("rules")
-    bot.reply_to(message, f"📜 *Rules:*\n{rules}")
+    rules_text = get_setting("rules")
+    bot.reply_to(message, f"📜 *Rules:*\n{rules_text}")
 
 # ---------- Shop ----------
 @bot.message_handler(func=lambda m: m.text == "🛍️ Shop")
@@ -591,12 +559,14 @@ def show_products(call):
         bot.answer_callback_query(call.id, "No products in this category.")
         return
     markup = InlineKeyboardMarkup(row_width=1)
+    curr = get_currency()
     for p in prods:
         stock = "∞" if p['stock'] == -1 else p['stock']
-        markup.add(InlineKeyboardButton(f"{p['name']} | {p['price']} {get_setting('currency')} | Stock: {stock}",
+        markup.add(InlineKeyboardButton(f"{p['name']} | {p['price']} {curr} | Stock: {stock}",
                                          callback_data=f"prod_{p['id']}"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="shop_main"))
     bot.edit_message_text("📦 Available Products:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("prod_"))
 def product_detail(call):
@@ -610,15 +580,16 @@ def product_detail(call):
     if not p:
         bot.answer_callback_query(call.id, "Product not found.")
         return
-    currency = get_setting("currency")
+    curr = get_currency()
     text = (f"📦 *{p['name']}*\n\n"
             f"📝 {p['description']}\n\n"
-            f"💰 Price: `{p['price']} {currency}`\n"
+            f"💰 Price: `{p['price']} {curr}`\n"
             f"📊 Stock: `{'Unlimited' if p['stock'] == -1 else p['stock']}`")
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🛒 Buy Now", callback_data=f"buy_{p['id']}"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"cat_{p['category_id']}"))
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def buy_product(call):
@@ -627,7 +598,6 @@ def buy_product(call):
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    # Get product and user
     c.execute("SELECT * FROM products WHERE id = ?", (prod_id,))
     p = c.fetchone()
     c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
@@ -637,7 +607,7 @@ def buy_product(call):
         conn.close()
         return
     if u['balance'] < p['price']:
-        bot.answer_callback_query(call.id, "❌ Insufficient balance!", show_alert=True)
+        bot.answer_callback_query(call.id, "❌ Insufficient points!", show_alert=True)
         conn.close()
         return
     if p['stock'] != -1 and p['stock'] <= 0:
@@ -645,20 +615,18 @@ def buy_product(call):
         conn.close()
         return
 
-    # Process purchase
     c.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id = ?",
               (p['price'], p['price'], user_id))
     if p['stock'] != -1:
         c.execute("UPDATE products SET stock = stock - 1 WHERE id = ?", (prod_id,))
 
-    # Determine delivery
     if p['type'] == 'digital':
         status = "delivered"
         delivery_data = p['content']
     elif p['type'] == 'file':
         status = "delivered"
-        delivery_data = p['content']  # file_id
-    else:  # manual
+        delivery_data = p['content']
+    else:
         status = "pending"
         delivery_data = "Manual fulfillment required"
 
@@ -667,7 +635,6 @@ def buy_product(call):
     conn.commit()
     add_transaction(user_id, -p['price'], "debit", f"Purchased {p['name']}")
 
-    # Send delivery
     if p['type'] == 'digital':
         bot.send_message(user_id, f"✅ Purchase Successful!\n\nYour item:\n`{delivery_data}`")
     elif p['type'] == 'file':
@@ -678,10 +645,12 @@ def buy_product(call):
     else:
         bot.send_message(user_id, "✅ Purchase Successful! Your order is pending admin approval. You'll receive it soon.")
     conn.close()
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "shop_main")
 def shop_main(call):
     shop_entry(call.message)
+    bot.answer_callback_query(call.id)
 
 # ---------- Admin Panel ----------
 @bot.message_handler(func=lambda m: m.text == "⚙️ Admin Panel")
@@ -704,13 +673,13 @@ def admin_stats(call):
     text = (f"📊 *Bot Statistics*\n\n"
             f"👥 Total Users: `{user_count}`\n"
             f"📦 Total Orders: `{order_count}`\n"
-            f"💰 Total Revenue: `{revenue:.2f} {get_setting('currency')}`")
+            f"💰 Total Revenue: `{revenue:.2f} {get_currency()}`")
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=admin_panel_kb())
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_users")
 @admin_only_callback
 def admin_users(call):
-    # Simple user list with pagination (first 10)
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -720,9 +689,10 @@ def admin_users(call):
     text = "👥 *Recent Users*\n\n"
     for u in users:
         status = "🔴 Banned" if u['banned'] else "🟢 Active"
-        text += f"🆔 {u['user_id']} | @{u['username']} | {u['balance']} | {status}\n"
+        text += f"🆔 {u['user_id']} | @{u['username']} | {u['balance']} {get_currency()} | {status}\n"
     text += "\nUse /search <id> to find a specific user."
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=admin_panel_kb())
+    bot.answer_callback_query(call.id)
 
 @bot.message_handler(commands=['search'])
 @admin_only
@@ -736,16 +706,17 @@ def search_user(message):
     if not user:
         bot.reply_to(message, "User not found.")
         return
+    curr = get_currency()
     text = (f"👤 *User Details*\n"
             f"ID: `{user['user_id']}`\n"
             f"Username: @{user['username']}\n"
             f"Name: {user['full_name']}\n"
-            f"Balance: {user['balance']}\n"
-            f"Spent: {user['total_spent']}\n"
+            f"Points: {user['balance']} {curr}\n"
+            f"Spent: {user['total_spent']} {curr}\n"
             f"Banned: {user['banned']}\n"
             f"Joined: {user['joined_at']}")
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("➕ Add Balance", callback_data=f"addbal_{user_id}"))
+    markup.add(InlineKeyboardButton("➕ Add Points", callback_data=f"addbal_{user_id}"))
     markup.add(InlineKeyboardButton("🔨 Ban/Unban", callback_data=f"ban_{user_id}"))
     bot.send_message(message.chat.id, text, reply_markup=markup)
 
@@ -755,6 +726,7 @@ def add_balance_start(call):
     user_id = call.data.split("_")[1]
     msg = bot.send_message(call.message.chat.id, f"Enter amount to add to user {user_id}:")
     bot.register_next_step_handler(msg, process_add_balance, user_id)
+    bot.answer_callback_query(call.id)
 
 def process_add_balance(message, target_id):
     try:
@@ -767,7 +739,7 @@ def process_add_balance(message, target_id):
     c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, target_id))
     conn.commit()
     add_transaction(target_id, amount, "credit", "Admin add")
-    bot.reply_to(message, f"✅ Added {amount} to user {target_id}.")
+    bot.reply_to(message, f"✅ Added {amount} {get_currency()} to user {target_id}.")
     conn.close()
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("ban_"))
@@ -791,6 +763,7 @@ def toggle_ban(call):
 def broadcast_start(call):
     msg = bot.send_message(call.message.chat.id, "📢 Send the message (text/photo/video) you want to broadcast:")
     bot.register_next_step_handler(msg, process_broadcast)
+    bot.answer_callback_query(call.id)
 
 def process_broadcast(message):
     conn = sqlite3.connect(DB_NAME)
@@ -828,12 +801,14 @@ def admin_shop(call):
     ]
     markup.add(*buttons)
     bot.edit_message_text("🛍 *Shop Management*", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "add_cat")
 @admin_only_callback
 def add_cat_start(call):
     msg = bot.send_message(call.message.chat.id, "📝 Enter new category name:")
     bot.register_next_step_handler(msg, add_cat_finish)
+    bot.answer_callback_query(call.id)
 
 def add_cat_finish(message):
     name = message.text.strip()
@@ -863,6 +838,7 @@ def del_cat_list(call):
     for cat in cats:
         markup.add(InlineKeyboardButton(f"❌ {cat['name']}", callback_data=f"delcat_{cat['id']}"))
     bot.edit_message_text("Select category to delete:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delcat_"))
 @admin_only_callback
@@ -874,13 +850,11 @@ def delete_category(call):
     conn.commit()
     conn.close()
     bot.answer_callback_query(call.id, "Category deleted.")
-    # Refresh list
     del_cat_list(call)
 
 @bot.callback_query_handler(func=lambda call: call.data == "add_prod")
 @admin_only_callback
 def add_prod_start(call):
-    # Ask for category first
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -894,48 +868,48 @@ def add_prod_start(call):
     for cat in cats:
         markup.add(InlineKeyboardButton(cat['name'], callback_data=f"selcat_{cat['id']}"))
     bot.edit_message_text("Select category for the new product:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("selcat_"))
 @admin_only_callback
 def add_prod_category(call):
     cat_id = int(call.data.split("_")[1])
-    set_state(call.from_user.id, "add_prod", {"cat_id": cat_id})
+    user_id = call.from_user.id
+    temp_data[user_id] = {'cat_id': cat_id}
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("Digital", callback_data="prodtype_digital"))
     markup.add(InlineKeyboardButton("File", callback_data="prodtype_file"))
     markup.add(InlineKeyboardButton("Manual", callback_data="prodtype_manual"))
     bot.edit_message_text("Select product type:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("prodtype_"))
 @admin_only_callback
 def add_prod_type(call):
     prod_type = call.data.split("_")[1]
-    state = get_state(call.from_user.id)
-    if state["state"] != "add_prod":
-        bot.answer_callback_query(call.id, "Session expired.")
-        return
-    state["data"]["type"] = prod_type
-    set_state(call.from_user.id, "add_prod", state["data"])
+    user_id = call.from_user.id
+    if user_id not in temp_data:
+        temp_data[user_id] = {}
+    temp_data[user_id]['type'] = prod_type
     msg = bot.send_message(call.message.chat.id, "Enter product name:")
     bot.register_next_step_handler(msg, add_prod_name)
+    bot.answer_callback_query(call.id)
 
 def add_prod_name(message):
-    state = get_state(message.from_user.id)
-    if state["state"] != "add_prod":
+    user_id = message.from_user.id
+    if user_id not in temp_data:
         bot.reply_to(message, "Session expired. Start over.")
         return
-    state["data"]["name"] = message.text.strip()
-    set_state(message.from_user.id, "add_prod", state["data"])
+    temp_data[user_id]['name'] = message.text.strip()
     msg = bot.reply_to(message, "Enter product description:")
     bot.register_next_step_handler(msg, add_prod_desc)
 
 def add_prod_desc(message):
-    state = get_state(message.from_user.id)
-    if state["state"] != "add_prod":
+    user_id = message.from_user.id
+    if user_id not in temp_data:
         bot.reply_to(message, "Session expired.")
         return
-    state["data"]["desc"] = message.text.strip()
-    set_state(message.from_user.id, "add_prod", state["data"])
+    temp_data[user_id]['desc'] = message.text.strip()
     msg = bot.reply_to(message, "Enter price (number):")
     bot.register_next_step_handler(msg, add_prod_price)
 
@@ -945,12 +919,11 @@ def add_prod_price(message):
     except:
         bot.reply_to(message, "Invalid price. Enter a number.")
         return
-    state = get_state(message.from_user.id)
-    if state["state"] != "add_prod":
+    user_id = message.from_user.id
+    if user_id not in temp_data:
         bot.reply_to(message, "Session expired.")
         return
-    state["data"]["price"] = price
-    set_state(message.from_user.id, "add_prod", state["data"])
+    temp_data[user_id]['price'] = price
     msg = bot.reply_to(message, "Enter stock (-1 for unlimited):")
     bot.register_next_step_handler(msg, add_prod_stock)
 
@@ -960,29 +933,26 @@ def add_prod_stock(message):
     except:
         bot.reply_to(message, "Invalid stock. Enter integer.")
         return
-    state = get_state(message.from_user.id)
-    if state["state"] != "add_prod":
+    user_id = message.from_user.id
+    if user_id not in temp_data:
         bot.reply_to(message, "Session expired.")
         return
-    state["data"]["stock"] = stock
-    set_state(message.from_user.id, "add_prod", state["data"])
-
-    # Based on type, ask for content
-    prod_type = state["data"]["type"]
+    temp_data[user_id]['stock'] = stock
+    prod_type = temp_data[user_id]['type']
     if prod_type == "digital":
         msg = bot.reply_to(message, "Enter the digital content (text) to deliver:")
     elif prod_type == "file":
         msg = bot.reply_to(message, "Upload the file (will be saved as file_id):")
-    else:  # manual
+    else:
         msg = bot.reply_to(message, "Enter instructions for manual fulfillment:")
     bot.register_next_step_handler(msg, add_prod_content)
 
 def add_prod_content(message):
-    state = get_state(message.from_user.id)
-    if state["state"] != "add_prod":
+    user_id = message.from_user.id
+    if user_id not in temp_data:
         bot.reply_to(message, "Session expired.")
         return
-    if state["data"]["type"] == "file":
+    if temp_data[user_id]['type'] == "file":
         if message.content_type == 'document':
             content = message.document.file_id
         else:
@@ -991,16 +961,15 @@ def add_prod_content(message):
     else:
         content = message.text.strip()
 
-    # Save to database
+    data = temp_data[user_id]
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("""INSERT INTO products (category_id, type, name, description, price, content, stock)
                  VALUES (?, ?, ?, ?, ?, ?, ?)""",
-              (state["data"]["cat_id"], state["data"]["type"], state["data"]["name"],
-               state["data"]["desc"], state["data"]["price"], content, state["data"]["stock"]))
+              (data['cat_id'], data['type'], data['name'], data['desc'], data['price'], content, data['stock']))
     conn.commit()
     conn.close()
-    clear_state(message.from_user.id)
+    del temp_data[user_id]
     bot.reply_to(message, "✅ Product added successfully!")
 
 # --- Orders ---
@@ -1015,6 +984,7 @@ def admin_orders(call):
     conn.close()
     if not orders:
         bot.edit_message_text("No pending orders.", call.message.chat.id, call.message.message_id, reply_markup=admin_panel_kb())
+        bot.answer_callback_query(call.id)
         return
     text = "📦 *Pending Orders*\n\n"
     markup = InlineKeyboardMarkup()
@@ -1022,6 +992,7 @@ def admin_orders(call):
         text += f"Order #{o['id']} | User: {o['user_id']} | Product: {o['product_id']} | {o['created_at']}\n"
         markup.add(InlineKeyboardButton(f"Order #{o['id']}", callback_data=f"order_{o['id']}"))
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("order_"))
 @admin_only_callback
@@ -1046,6 +1017,7 @@ def order_detail(call):
     if o['status'] == 'pending':
         markup.add(InlineKeyboardButton("✅ Mark Delivered", callback_data=f"markdelivered_{order_id}"))
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("markdelivered_"))
 @admin_only_callback
@@ -1057,7 +1029,6 @@ def mark_delivered(call):
     conn.commit()
     conn.close()
     bot.answer_callback_query(call.id, "Order marked delivered.")
-    # Refresh order detail
     order_detail(call)
 
 # --- Settings ---
@@ -1082,24 +1053,28 @@ def admin_settings(call):
     markup.add(InlineKeyboardButton("🔁 Toggle Shop", callback_data="toggle_shop"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
     bot.edit_message_text("⚙️ *Bot Settings*", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("editset_"))
 @admin_only_callback
 def edit_setting_start(call):
     key = call.data.split("_")[1]
-    set_state(call.from_user.id, "edit_setting", {"key": key})
+    user_id = call.from_user.id
+    temp_data[user_id] = {'edit_key': key}
     current = get_setting(key)
     msg = bot.send_message(call.message.chat.id, f"Current value: `{current}`\n\nSend new value:")
     bot.register_next_step_handler(msg, edit_setting_finish)
+    bot.answer_callback_query(call.id)
 
 def edit_setting_finish(message):
-    state = get_state(message.from_user.id)
-    if state["state"] != "edit_setting":
+    user_id = message.from_user.id
+    if user_id not in temp_data or 'edit_key' not in temp_data[user_id]:
+        bot.reply_to(message, "Session expired.")
         return
-    key = state["data"]["key"]
+    key = temp_data[user_id]['edit_key']
     new_val = message.text.strip()
     update_setting(key, new_val)
-    clear_state(message.from_user.id)
+    del temp_data[user_id]
     bot.reply_to(message, f"✅ Setting `{key}` updated!")
 
 @bot.callback_query_handler(func=lambda call: call.data == "toggle_captcha")
@@ -1110,7 +1085,6 @@ def toggle_captcha(call):
     update_setting("captcha_enabled", new)
     bot.answer_callback_query(call.id, f"Captcha {'disabled' if new=='0' else 'enabled'}.")
 
-# Similar toggles for daily, scratch, shop
 @bot.callback_query_handler(func=lambda call: call.data == "toggle_daily")
 @admin_only_callback
 def toggle_daily(call):
@@ -1144,16 +1118,19 @@ def admin_promos(call):
     markup.add(InlineKeyboardButton("📋 List Promos", callback_data="list_promos"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
     bot.edit_message_text("🎁 *Promo Management*", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "create_promo")
 @admin_only_callback
 def create_promo_start(call):
     msg = bot.send_message(call.message.chat.id, "Enter promo code (e.g., SUMMER20):")
     bot.register_next_step_handler(msg, create_promo_code)
+    bot.answer_callback_query(call.id)
 
 def create_promo_code(message):
     code = message.text.strip().upper()
-    set_state(message.from_user.id, "create_promo", {"code": code})
+    user_id = message.from_user.id
+    temp_data[user_id] = {'promo_code': code}
     msg = bot.reply_to(message, "Enter reward amount:")
     bot.register_next_step_handler(msg, create_promo_reward)
 
@@ -1163,11 +1140,11 @@ def create_promo_reward(message):
     except:
         bot.reply_to(message, "Invalid number.")
         return
-    state = get_state(message.from_user.id)
-    if state["state"] != "create_promo":
+    user_id = message.from_user.id
+    if user_id not in temp_data:
+        bot.reply_to(message, "Session expired.")
         return
-    state["data"]["reward"] = reward
-    set_state(message.from_user.id, "create_promo", state["data"])
+    temp_data[user_id]['reward'] = reward
     msg = bot.reply_to(message, "Enter max uses (-1 for unlimited):")
     bot.register_next_step_handler(msg, create_promo_usage)
 
@@ -1177,11 +1154,11 @@ def create_promo_usage(message):
     except:
         bot.reply_to(message, "Invalid integer.")
         return
-    state = get_state(message.from_user.id)
-    if state["state"] != "create_promo":
+    user_id = message.from_user.id
+    if user_id not in temp_data:
+        bot.reply_to(message, "Session expired.")
         return
-    state["data"]["max_usage"] = max_usage
-    set_state(message.from_user.id, "create_promo", state["data"])
+    temp_data[user_id]['max_usage'] = max_usage
     msg = bot.reply_to(message, "Enter expiry date (YYYY-MM-DD) or leave blank for no expiry:")
     bot.register_next_step_handler(msg, create_promo_expiry)
 
@@ -1190,12 +1167,13 @@ def create_promo_expiry(message):
     if expiry and not re.match(r"\d{4}-\d{2}-\d{2}", expiry):
         bot.reply_to(message, "Invalid date format. Use YYYY-MM-DD")
         return
-    state = get_state(message.from_user.id)
-    if state["state"] != "create_promo":
+    user_id = message.from_user.id
+    if user_id not in temp_data:
+        bot.reply_to(message, "Session expired.")
         return
-    code = state["data"]["code"]
-    reward = state["data"]["reward"]
-    max_usage = state["data"]["max_usage"]
+    code = temp_data[user_id]['promo_code']
+    reward = temp_data[user_id]['reward']
+    max_usage = temp_data[user_id]['max_usage']
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     try:
@@ -1206,7 +1184,7 @@ def create_promo_expiry(message):
     except sqlite3.IntegrityError:
         bot.reply_to(message, "❌ Promo code already exists.")
     conn.close()
-    clear_state(message.from_user.id)
+    del temp_data[user_id]
 
 @bot.callback_query_handler(func=lambda call: call.data == "list_promos")
 @admin_only_callback
@@ -1224,6 +1202,7 @@ def list_promos(call):
     for p in promos:
         text += f"Code: `{p['code']}` | Reward: {p['reward']} | Used: {p['used_count']}/{p['max_usage'] if p['max_usage']!=-1 else '∞'} | Expiry: {p['expiry_date'] or 'None'}\n"
     bot.send_message(call.message.chat.id, text)
+    bot.answer_callback_query(call.id)
 
 # --- Tasks Management ---
 @bot.callback_query_handler(func=lambda call: call.data == "admin_tasks")
@@ -1234,16 +1213,19 @@ def admin_tasks(call):
     markup.add(InlineKeyboardButton("📋 List Tasks", callback_data="list_tasks_admin"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
     bot.edit_message_text("📋 *Task Management*", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "add_task")
 @admin_only_callback
 def add_task_start(call):
     msg = bot.send_message(call.message.chat.id, "Enter task description:")
     bot.register_next_step_handler(msg, add_task_desc)
+    bot.answer_callback_query(call.id)
 
 def add_task_desc(message):
     desc = message.text.strip()
-    set_state(message.from_user.id, "add_task", {"desc": desc})
+    user_id = message.from_user.id
+    temp_data[user_id] = {'task_desc': desc}
     msg = bot.reply_to(message, "Enter task link (or 'none'):")
     bot.register_next_step_handler(msg, add_task_link)
 
@@ -1251,11 +1233,11 @@ def add_task_link(message):
     link = message.text.strip()
     if link.lower() == "none":
         link = ""
-    state = get_state(message.from_user.id)
-    if state["state"] != "add_task":
+    user_id = message.from_user.id
+    if user_id not in temp_data:
+        bot.reply_to(message, "Session expired.")
         return
-    state["data"]["link"] = link
-    set_state(message.from_user.id, "add_task", state["data"])
+    temp_data[user_id]['link'] = link
     msg = bot.reply_to(message, "Enter reward amount:")
     bot.register_next_step_handler(msg, add_task_reward)
 
@@ -1265,17 +1247,18 @@ def add_task_reward(message):
     except:
         bot.reply_to(message, "Invalid number.")
         return
-    state = get_state(message.from_user.id)
-    if state["state"] != "add_task":
+    user_id = message.from_user.id
+    if user_id not in temp_data:
+        bot.reply_to(message, "Session expired.")
         return
-    desc = state["data"]["desc"]
-    link = state["data"]["link"]
+    desc = temp_data[user_id]['task_desc']
+    link = temp_data[user_id]['link']
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("INSERT INTO tasks (description, link, reward) VALUES (?, ?, ?)", (desc, link, reward))
     conn.commit()
     conn.close()
-    clear_state(message.from_user.id)
+    del temp_data[user_id]
     bot.reply_to(message, "✅ Task added.")
 
 @bot.callback_query_handler(func=lambda call: call.data == "list_tasks_admin")
@@ -1296,6 +1279,7 @@ def list_tasks_admin(call):
         text += f"ID {t['id']}: {t['description']} | Reward: {t['reward']}\n"
         markup.add(InlineKeyboardButton(f"❌ Delete task {t['id']}", callback_data=f"deltask_{t['id']}"))
     bot.send_message(call.message.chat.id, text, reply_markup=markup)
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("deltask_"))
 @admin_only_callback
@@ -1309,24 +1293,43 @@ def delete_task(call):
     bot.answer_callback_query(call.id, "Task deleted.")
     list_tasks_admin(call)
 
+# --- Leaderboard ---
+@bot.callback_query_handler(func=lambda call: call.data == "admin_leaderboard")
+@admin_only_callback
+def admin_leaderboard(call):
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT 10")
+    top = c.fetchall()
+    conn.close()
+    if not top:
+        bot.send_message(call.message.chat.id, "No users yet.")
+        bot.answer_callback_query(call.id)
+        return
+    text = "🏆 *Top 10 Users by Points*\n\n"
+    for i, u in enumerate(top, 1):
+        text += f"{i}. {u['username'] or u['user_id']} – {u['balance']} {get_currency()}\n"
+    bot.send_message(call.message.chat.id, text)
+    bot.answer_callback_query(call.id)
+
 # --- Backup ---
 @bot.callback_query_handler(func=lambda call: call.data == "admin_backup")
 @admin_only_callback
 def admin_backup(call):
     with open(DB_NAME, 'rb') as f:
         bot.send_document(call.message.chat.id, f, caption=f"📅 Database backup {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    bot.answer_callback_query(call.id)
 
 # --- Fallback to main menu for any text ---
 @bot.message_handler(func=lambda m: True)
 def fallback(message):
-    # If user sends something else, maybe show main menu?
     is_admin = str(message.from_user.id) == str(ADMIN_ID)
     bot.send_message(message.chat.id, "Use the menu below:", reply_markup=main_menu_kb(is_admin))
 
 # ---------- Main ----------
 if __name__ == "__main__":
     init_db()
-    # Start Flask in a separate thread
     threading.Thread(target=run_flask, daemon=True).start()
     logging.basicConfig(level=logging.INFO)
     print("🤖 Bot is polling...")
