@@ -6,11 +6,9 @@ import random
 import zipfile
 import io
 from datetime import datetime, date
-from typing import Optional
-
-from flask import Flask, jsonify
 import threading
 
+from flask import Flask, jsonify
 import aiosqlite
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -27,8 +25,6 @@ from aiogram.types import (
     ParseMode,
     ContentType,
 )
-from aiogram.utils.callback_data import CallbackData
-from aiogram.utils.exceptions import ChatNotFound
 from dotenv import load_dotenv
 
 # Load environment
@@ -48,7 +44,8 @@ def home():
     return jsonify({
         "status": "running",
         "bot": "Telegram Shop Bot",
-        "version": "3.0",
+        "version": "4.0",
+        "python": "3.11",
         "timestamp": datetime.now().isoformat()
     })
 
@@ -243,7 +240,6 @@ async def add_user(user_id, username, full_name, referrer_id=None):
         
         await db.commit()
 
-# ---------- Backup Function ----------
 async def create_backup(bot: Bot, chat_id: int):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_filename = f"backup_{timestamp}.zip"
@@ -311,12 +307,18 @@ def generate_emoji_captcha():
 
 # ---------- Keyboards ----------
 def main_menu_kb(is_admin=False):
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("🛍 Shop", "👤 Profile", "🎁 Daily Bonus")
-    kb.row("🎲 Scratch Card", "📋 Tasks", "ℹ️ Support")
-    kb.row("📜 Rules")
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(
+        KeyboardButton("🛍 Shop"),
+        KeyboardButton("👤 Profile"),
+        KeyboardButton("🎁 Daily Bonus"),
+        KeyboardButton("🎲 Scratch Card"),
+        KeyboardButton("📋 Tasks"),
+        KeyboardButton("ℹ️ Support"),
+        KeyboardButton("📜 Rules")
+    )
     if is_admin:
-        kb.row("⚙️ Admin Panel")
+        kb.add(KeyboardButton("⚙️ Admin Panel"))
     return kb
 
 def admin_panel_kb():
@@ -336,13 +338,15 @@ def admin_panel_kb():
     return kb
 
 def shop_mgmt_kb():
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("➕ Add Category", callback_data="admin_add_cat"))
-    kb.add(InlineKeyboardButton("📋 List Categories", callback_data="admin_list_cats"))
-    kb.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("➕ Add Category", callback_data="admin_add_cat"),
+        InlineKeyboardButton("📋 List Categories", callback_data="admin_list_cats"),
+        InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
+    )
     return kb
 
-# ---------- Bot Initialization ----------
+# ---------- Bot Setup ----------
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
@@ -420,16 +424,37 @@ ID: `{user['user_id']}`
 🏅 Level: {level}
 📅 Joined: {user['joined_at']}"""
     
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("📦 Orders", callback_data="my_orders"))
-    kb.add(InlineKeyboardButton("📜 History", callback_data="my_transactions"))
-    kb.add(InlineKeyboardButton("🎁 Redeem", callback_data="redeem_promo"))
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📦 Orders", callback_data="my_orders"),
+        InlineKeyboardButton("📜 History", callback_data="my_transactions"),
+        InlineKeyboardButton("🎁 Redeem", callback_data="redeem_promo")
+    )
     
     await message.reply(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
     
-    bot_info = await bot.me
+    bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user['user_id']}"
     await message.reply(f"🔗 **Referral Link:**\n`{ref_link}`")
+
+@dp.callback_query_handler(lambda c: c.data == "my_transactions")
+async def my_transactions(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 10", (user_id,))
+        txs = await cur.fetchall()
+    
+    if not txs:
+        return await callback.message.edit_text("📭 No transactions")
+    
+    text = "📊 **Transactions:**\n"
+    for t in txs:
+        sign = "+" if t['amount'] > 0 else ""
+        text += f"\n• {t['created_at'][:10]} {t['type']}: {sign}{t['amount']} Credits"
+    
+    await callback.message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
 
 # ---------- Daily Bonus ----------
 @dp.message_handler(lambda msg: msg.text == "🎁 Daily Bonus")
@@ -449,7 +474,7 @@ async def daily_bonus(message: Message):
         amount = float(await get_setting("daily_bonus_amount"))
         await db.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, user_id))
         await db.execute("INSERT OR REPLACE INTO daily_bonus VALUES (?,?)", (user_id, today))
-        await db.execute("INSERT INTO transactions (user_id,amount,type,description) VALUES (?,?,'daily_bonus','Daily bonus')", (user_id, amount))
+        await db.execute("INSERT INTO transactions (user_id,amount,type,description) VALUES (?,?,'daily','Daily bonus')", (user_id, amount))
         await db.commit()
     
     await message.reply(f"🎉 **+{amount} Credits**")
@@ -469,7 +494,7 @@ async def scratch_card(message: Message):
         if row and row[0] == today:
             return await message.reply("⏳ Already scratched today")
         
-        rewards = [float(x) for x in (await get_setting("scratch_rewards")).split(",") if x]
+        rewards = [float(x.strip()) for x in (await get_setting("scratch_rewards")).split(",") if x.strip()]
         amount = random.choice(rewards) if rewards else 10
         
         await db.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, user_id))
@@ -485,20 +510,17 @@ async def tasks_list(message: Message):
     user_id = message.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("""
-            SELECT * FROM tasks 
-            WHERE id NOT IN (SELECT task_id FROM completed_tasks WHERE user_id=?)
-        """, (user_id,))
+        cur = await db.execute("SELECT * FROM tasks WHERE id NOT IN (SELECT task_id FROM completed_tasks WHERE user_id=?)", (user_id,))
         tasks = await cur.fetchall()
     
     if not tasks:
         return await message.reply("✅ No tasks available")
     
     text = "📋 **Tasks:**\n"
-    kb = InlineKeyboardMarkup()
+    kb = InlineKeyboardMarkup(row_width=1)
     for t in tasks:
         text += f"\n🔹 {t['description']} – {t['reward']} Credits"
-        kb.add(InlineKeyboardButton(f"✅ Do Task", callback_data=f"do_task_{t['id']}"))
+        kb.add(InlineKeyboardButton(f"✅ Complete", callback_data=f"do_task_{t['id']}"))
     
     await message.reply(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
@@ -596,7 +618,7 @@ async def show_products(callback: CallbackQuery):
     if not prods:
         return await callback.message.edit_text("📭 No products")
     
-    kb = InlineKeyboardMarkup()
+    kb = InlineKeyboardMarkup(row_width=1)
     for p in prods:
         stock = "∞" if p['stock'] == -1 else p['stock']
         kb.add(InlineKeyboardButton(f"{p['name']} | {p['price']} | Stock:{stock}", callback_data=f"prod_{p['id']}"))
@@ -620,10 +642,18 @@ async def product_detail(callback: CallbackQuery):
 📦 Stock: `{'Unlimited' if prod['stock']==-1 else prod['stock']}`
 Type: `{prod['type']}`"""
     
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("💳 Buy", callback_data=f"buy_{prod['id']}"))
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("💳 Buy", callback_data=f"buy_{prod['id']}"),
+        InlineKeyboardButton("🔙 Back", callback_data=f"back_to_cat_{prod['category_id']}")
+    )
     
     await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("back_to_cat_"))
+async def back_to_cat(callback: CallbackQuery):
+    cat_id = int(callback.data.split("_")[3])
+    await show_products(callback)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("buy_"))
 async def buy(callback: CallbackQuery, state: FSMContext):
@@ -651,9 +681,9 @@ async def buy(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     
-    await process_purchase(user_id, prod, callback.message)
+    await process_purchase(user_id, prod, callback.message, callback.from_user)
 
-async def process_purchase(user_id, prod, msg, address=""):
+async def process_purchase(user_id, prod, msg, user_data, address=""):
     new_balance = user['balance'] - prod['price']
     new_stock = prod['stock'] - 1 if prod['stock'] != -1 else -1
     
@@ -675,7 +705,7 @@ async def process_purchase(user_id, prod, msg, address=""):
     
     if prod['type'] == 'file':
         try:
-            await bot.send_document(user_id, prod['content'], caption=prod['name'])
+            await bot.send_document(user_id, prod['content'], caption=f"📁 {prod['name']}")
         except:
             await msg.answer("❌ File delivery failed")
     elif prod['type'] == 'digital':
@@ -694,7 +724,7 @@ async def save_address(message: Message, state: FSMContext):
         cur = await db.execute("SELECT * FROM users WHERE user_id=?", (message.from_user.id,))
         user = await cur.fetchone()
     
-    await process_purchase(message.from_user.id, prod, message, addr)
+    await process_purchase(message.from_user.id, prod, message, message.from_user, addr)
     await state.finish()
 
 @dp.callback_query_handler(lambda c: c.data == "my_orders")
@@ -702,11 +732,7 @@ async def my_orders(callback: CallbackQuery):
     user_id = callback.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("""
-            SELECT orders.*, products.name FROM orders 
-            JOIN products ON orders.product_id=products.id 
-            WHERE user_id=? ORDER BY created_at DESC LIMIT 5
-        """, (user_id,))
+        cur = await db.execute("SELECT orders.*, products.name FROM orders JOIN products ON orders.product_id=products.id WHERE user_id=? ORDER BY created_at DESC LIMIT 5", (user_id,))
         orders = await cur.fetchall()
     
     if not orders:
@@ -717,6 +743,7 @@ async def my_orders(callback: CallbackQuery):
         text += f"\n🔹 {o['name']} – {o['status'].upper()}"
     
     await callback.message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
 
 # ---------- Admin Panel ----------
 @dp.message_handler(lambda msg: msg.text == "⚙️ Admin Panel")
@@ -741,6 +768,7 @@ async def admin_stats(callback: CallbackQuery):
 💰 Revenue: `{revenue}` {await get_setting('currency')}"""
     
     await callback.message.edit_text(text, reply_markup=admin_panel_kb(), parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "admin_backup")
 async def admin_backup(callback: CallbackQuery):
@@ -804,7 +832,7 @@ async def list_cats(callback: CallbackQuery):
     if not cats:
         return await callback.message.edit_text("📭 No categories")
     
-    kb = InlineKeyboardMarkup()
+    kb = InlineKeyboardMarkup(row_width=3)
     for c in cats:
         kb.row(
             InlineKeyboardButton(f"📁 {c['name']}", callback_data=f"admin_cat_{c['id']}"),
@@ -851,7 +879,7 @@ async def cat_products(callback: CallbackQuery):
         cur = await db.execute("SELECT * FROM products WHERE category_id=?", (cat_id,))
         prods = await cur.fetchall()
     
-    kb = InlineKeyboardMarkup()
+    kb = InlineKeyboardMarkup(row_width=3)
     for p in prods:
         kb.row(
             InlineKeyboardButton(f"{p['name']} | {p['price']}", callback_data=f"admin_prod_{p['id']}"),
@@ -890,7 +918,7 @@ async def prod_price(message: Message, state: FSMContext):
         await state.update_data(price=price)
         
         kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        kb.row("digital", "file", "physical")
+        kb.add("digital", "file", "physical")
         
         await message.reply("📦 **Type:**", reply_markup=kb)
         await AdminStates.waiting_for_product_type.set()
@@ -935,10 +963,8 @@ async def prod_stock(message: Message, state: FSMContext):
         data = await state.get_data()
         
         async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("""
-                INSERT INTO products (category_id, name, description, price, type, content, stock)
-                VALUES (?,?,?,?,?,?,?)
-            """, (data['cat_id'], data['name'], data['desc'], data['price'], data['type'], data['content'], stock))
+            await db.execute("INSERT INTO products (category_id, name, description, price, type, content, stock) VALUES (?,?,?,?,?,?,?)",
+                            (data['cat_id'], data['name'], data['desc'], data['price'], data['type'], data['content'], stock))
             await db.commit()
         
         await message.reply("✅ **Product added!**")
@@ -1004,9 +1030,11 @@ async def del_prod(callback: CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "admin_users")
 async def users_menu(callback: CallbackQuery):
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🔎 Search", callback_data="admin_search_user"))
-    kb.add(InlineKeyboardButton("📋 List", callback_data="admin_list_users"))
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔎 Search", callback_data="admin_search_user"),
+        InlineKeyboardButton("📋 List", callback_data="admin_list_users")
+    )
     await callback.message.edit_text("👥 **Users**", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_search_user")
@@ -1036,9 +1064,11 @@ Username: @{user['username']}
 Balance: `{user['balance']}`
 Banned: `{bool(user['banned'])}`"""
     
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("💰 Give", callback_data=f"admin_give_bal_{user['user_id']}"))
-    kb.add(InlineKeyboardButton("🚫 Ban", callback_data=f"admin_ban_{user['user_id']}"))
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("💰 Give", callback_data=f"admin_give_bal_{user['user_id']}"),
+        InlineKeyboardButton("🚫 Ban", callback_data=f"admin_ban_{user['user_id']}")
+    )
     
     await message.reply(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
     await state.finish()
@@ -1090,6 +1120,7 @@ async def list_users(callback: CallbackQuery):
         text += f"\n`{u['user_id']}` | {u['full_name']} | `{u['balance']}`"
     
     await callback.message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "admin_settings")
 async def settings_menu(callback: CallbackQuery):
@@ -1149,9 +1180,11 @@ async def save_setting(message: Message, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data == "admin_promos")
 async def promos_menu(callback: CallbackQuery):
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("➕ Create", callback_data="admin_create_promo"))
-    kb.add(InlineKeyboardButton("📋 List", callback_data="admin_list_promos"))
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ Create", callback_data="admin_create_promo"),
+        InlineKeyboardButton("📋 List", callback_data="admin_list_promos")
+    )
     await callback.message.edit_text("🎁 **Promos**", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_create_promo")
@@ -1219,9 +1252,11 @@ async def del_promo(callback: CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "admin_tasks")
 async def tasks_admin_menu(callback: CallbackQuery):
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("➕ Create", callback_data="admin_create_task"))
-    kb.add(InlineKeyboardButton("📋 List", callback_data="admin_list_tasks"))
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ Create", callback_data="admin_create_task"),
+        InlineKeyboardButton("📋 List", callback_data="admin_list_tasks")
+    )
     await callback.message.edit_text("📋 **Tasks**", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_create_task")
@@ -1287,11 +1322,7 @@ async def del_task(callback: CallbackQuery):
 async def admin_orders(callback: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("""
-            SELECT orders.*, products.name FROM orders 
-            JOIN products ON orders.product_id=products.id 
-            WHERE status='pending'
-        """)
+        cur = await db.execute("SELECT orders.*, products.name FROM orders JOIN products ON orders.product_id=products.id WHERE status='pending'")
         orders = await cur.fetchall()
     
     if not orders:
