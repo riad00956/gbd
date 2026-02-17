@@ -1,1255 +1,1193 @@
+import asyncio
+import logging
 import os
-import sqlite3
+import sys
 import random
-import threading
-from datetime import datetime, date
-from functools import wraps
+import time
+from datetime import datetime, timedelta
+from typing import Optional, List, Union
 
-from flask import Flask, jsonify
-import telebot
-from telebot import types
+import aiosqlite
+from aiogram import Bot, Dispatcher, Router, F, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ContentType
+from aiogram.filters import Command, CommandStart, MagicData
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    CallbackQuery,
+    Message,
+    FSInputFile
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from dotenv import load_dotenv
 
-# ---------- কনফিগারেশন ----------
+# Load environment variables
+load_dotenv()
+
+# --- Configuration ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-PORT = int(os.getenv("PORT", 10000))
+ADMIN_ID = os.getenv("ADMIN_ID")
+
+# --- Database Setup ---
 DB_NAME = "shop_bot.db"
 
-bot = telebot.TeleBot(TOKEN)
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Settings
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        # Initialize default settings if not exist
+        defaults = {
+            "welcome_message": "Welcome to our Premium Shop, {name}!",
+            "currency": "$",
+            "support_link": "https://t.me/telegram",
+            "rules": "No spamming. Be respectful.",
+            "channel_force_join": "", # Chat ID
+            "captcha_enabled": "1", # 1 or 0
+            "shop_enabled": "1",
+            "referral_reward": "5.0",
+            "referral_type": "fixed", # fixed or percentage
+            "daily_reward": "2.0", # Fixed reward for daily bonus
+            "daily_enabled": "1", # 1 or 0
+            "scratch_enabled": "1", # 1 or 0
+            "scratch_rewards": "1.0,5.0,10.0", # Comma-separated rewards
+            "backup_link": "coming soon" # Placeholder for backup link
+        }
+        for key, val in defaults.items():
+            await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
 
-# ---------- Flask (হেলথ চেক) ----------
-app = Flask(__name__)
+        # Users
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                balance REAL DEFAULT 0.0,
+                referrer_id INTEGER,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                banned INTEGER DEFAULT 0,
+                last_daily_claim TIMESTAMP,
+                last_scratch_claim TIMESTAMP
+            )
+        """)
+        
+        # Categories
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE
+            )
+        """)
+        
+        # Products
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id INTEGER,
+                type TEXT, -- 'digital', 'file', 'physical'
+                name TEXT,
+                description TEXT,
+                price REAL,
+                content TEXT, -- Key/Data/FileID
+                stock INTEGER DEFAULT -1, -- -1 for unlimited
+                FOREIGN KEY(category_id) REFERENCES categories(id)
+            )
+        """)
+        
+        # Orders
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                product_id INTEGER,
+                status TEXT, -- 'pending', 'approved', 'delivered', 'rejected'
+                data TEXT, -- Delivered content or user input for physical
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Tasks
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                description TEXT,
+                link TEXT,
+                reward REAL
+            )
+        """)
+        
+        # Completed Tasks
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS completed_tasks (
+                user_id INTEGER,
+                task_id INTEGER,
+                PRIMARY KEY (user_id, task_id)
+            )
+        """)
+        
+        # Promos
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS promos (
+                code TEXT PRIMARY KEY,
+                reward REAL,
+                max_usage INTEGER,
+                used_count INTEGER DEFAULT 0,
+                expiry_date TEXT
+            )
+        """)
+        
+        # Promo Usage
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS promo_usage (
+                user_id INTEGER,
+                code TEXT,
+                PRIMARY KEY (user_id, code)
+            )
+        """)
 
-@app.route('/')
-def home():
-    return jsonify({"status": "running", "time": str(datetime.now())})
+        await db.commit()
 
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy"}), 200
+# --- Database Helpers ---
+async def get_setting(key):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
-def run_flask():
-    app.run(host='0.0.0.0', port=PORT)
+async def update_setting(key, value):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+        await db.commit()
 
-# ---------- ডাটাবেস ----------
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
+async def get_user(user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone()
+
+async def add_user(user_id, username, full_name, referrer_id=None):
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Check if user exists
+        async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            if await cursor.fetchone():
+                return # User exists
+
+        await db.execute("""
+            INSERT INTO users (user_id, username, full_name, referrer_id)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, username, full_name, referrer_id))
+        
+        # Process Referral Reward
+        if referrer_id:
+            reward_type = await get_setting("referral_type") # fixed or percentage (only on purchase for percentage)
+            if reward_type == "fixed":
+                reward = float(await get_setting("referral_reward") or 0)
+                await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (reward, referrer_id))
+        
+        await db.commit()
+
+# --- FSM States ---
+class AdminStates(StatesGroup):
+    waiting_for_broadcast = State()
+    waiting_for_category_name = State()
+    
+    # Product
+    waiting_for_product_category = State()
+    waiting_for_product_type = State()
+    waiting_for_product_name = State()
+    waiting_for_product_desc = State()
+    waiting_for_product_price = State()
+    waiting_for_product_stock = State()
+    waiting_for_product_content = State()
+    
+    # User Mgmt
+    waiting_for_user_search = State()
+    waiting_for_balance_change = State()
     
     # Settings
-    c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-    defaults = {
-        "welcome": "🌟 Welcome {name}!",
-        "currency": "💎",
-        "support": "t.me/admin",
-        "rules": "📜 Be nice",
-        "channel": "",
-        "captcha": "1",
-        "shop": "1",
-        "referral": "5",
-        "daily_on": "1",
-        "daily_amt": "10",
-        "scratch_on": "1",
-        "scratch_rew": "5,10,15,20,25",
-    }
-    for k, v in defaults.items():
-        c.execute("INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)", (k, v))
-
-    # Users
-    c.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT,
-        balance REAL DEFAULT 0, total_spent REAL DEFAULT 0,
-        referrer INTEGER, joined TEXT DEFAULT CURRENT_TIMESTAMP,
-        banned INTEGER DEFAULT 0)""")
-
-    # Categories
-    c.execute("CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE)")
-    
-    # Products
-    c.execute("""CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, cat_id INTEGER, type TEXT, name TEXT,
-        desc TEXT, price REAL, content TEXT, stock INTEGER DEFAULT -1)""")
-    
-    # Orders
-    c.execute("""CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, product_id INTEGER,
-        status TEXT, data TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    waiting_for_setting_key = State()
+    waiting_for_setting_value = State()
     
     # Tasks
-    c.execute("""CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, desc TEXT, link TEXT, reward REAL)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS completed (
-        user_id INTEGER, task_id INTEGER, PRIMARY KEY (user_id,task_id))""")
+    waiting_for_task_desc = State()
+    waiting_for_task_link = State()
+    waiting_for_task_reward = State()
     
     # Promos
-    c.execute("""CREATE TABLE IF NOT EXISTS promos (
-        code TEXT PRIMARY KEY, reward REAL, max_use INTEGER,
-        used INTEGER DEFAULT 0, expiry TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS promo_used (
-        user_id INTEGER, code TEXT, PRIMARY KEY (user_id,code))""")
+    waiting_for_promo_code = State()
+    waiting_for_promo_reward = State()
+    waiting_for_promo_limit = State()
+    waiting_for_promo_expiry = State() # Not fully implemented in current handler logic
 
-    # Transactions
-    c.execute("""CREATE TABLE IF NOT EXISTS tx (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL,
-        type TEXT, desc TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP)""")
+class ShopStates(StatesGroup):
+    captcha = State()
+    waiting_for_custom_order_input = State()
 
-    # Daily / Scratch tracking
-    c.execute("CREATE TABLE IF NOT EXISTS daily (user_id INTEGER PRIMARY KEY, last TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS scratch (user_id INTEGER PRIMARY KEY, last TEXT)")
+class UserStates(StatesGroup):
+    waiting_for_promo = State()
+    waiting_for_daily_claim = State()
+    waiting_for_scratch_claim = State()
 
-    conn.commit()
-    conn.close()
+# --- Bot & Router ---
+router = Router()
 
-# ---------- ডাটাবেস হেল্পার ----------
-def get_setting(key):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key=?", (key,))
-    r = c.fetchone()
-    conn.close()
-    return r[0] if r else None
-
-def set_setting(key, val):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("REPLACE INTO settings VALUES (?,?)", (key, str(val)))
-    conn.commit()
-    conn.close()
-
-def get_user(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    r = c.fetchone()
-    conn.close()
-    return dict(r) if r else None
-
-def add_user(uid, uname, fname, ref=None):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
-    if c.fetchone():
-        conn.close()
-        return
-    c.execute("INSERT INTO users (user_id,username,full_name,referrer) VALUES (?,?,?,?)",
-              (uid, uname, fname, ref))
-    if ref:
-        rew = float(get_setting("referral"))
-        c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (rew, ref))
-        c.execute("INSERT INTO tx (user_id,amount,type,desc) VALUES (?,?,'referral','New user')", (ref, rew))
-    conn.commit()
-    conn.close()
-
-# ---------- ইউটিলিটি ----------
-def is_admin(user_id):
-    return user_id == ADMIN_ID
-
-def main_menu_kb(uid):
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    btns = ["🛍 Shop", "👤 Profile", "🎁 Daily", "🎲 Scratch", "📋 Tasks", "ℹ️ Support", "📜 Rules"]
-    if is_admin(uid):
-        btns.append("⚙️ Admin")
-    kb.add(*btns)
-    return kb
-
-def gen_captcha():
-    emojis = ["😀","😂","😍","🥺","😎","🎉","🔥","⭐","🐶","🐱","🐼"]
-    s = random.sample(emojis, 4)
-    i = random.randint(0,3)
-    ans = s[i]
-    s[i] = "___"
-    return " ".join(s), ans
-
-# ---------- /start ----------
-@bot.message_handler(commands=['start'])
-def start(message):
-    uid = message.from_user.id
-    un = message.from_user.username or ""
-    fn = message.from_user.full_name
-    args = message.text.split()
-    ref = None
-    if len(args) > 1 and args[1].isdigit():
-        ref_id = int(args[1])
-        if ref_id != uid and get_user(ref_id):
-            ref = ref_id
-    add_user(uid, un, fn, ref)
+# --- Keyboards ---
+def main_menu_kb(is_admin=False):
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="🛍️ Shop")
+    builder.button(text="👤 Profile")
+    builder.button(text="🎁 Daily Bonus") # Added Daily Bonus
+    builder.button(text="✨ Scratch Card") # Added Scratch Card
+    builder.button(text="📋 Tasks")
+    builder.button(text="ℹ️ Support")
+    builder.button(text="📜 Rules")
     
-    if get_setting("captcha") == "1":
-        q, a = gen_captcha()
-        bot.send_message(uid, f"🔒 Captcha:\n{q}\nType missing emoji:", parse_mode='Markdown')
-        bot.register_next_step_handler_by_chat_id(uid, captcha_handler, a)
-    else:
-        welcome(uid)
+    if is_admin:
+        builder.button(text="⚙️ Admin Panel")
+    
+    builder.adjust(2)
+    return builder.as_markup(resize_keyboard=True)
 
-def captcha_handler(message, ans):
-    uid = message.chat.id
-    if message.text.strip() == ans:
-        welcome(uid)
-    else:
-        q, a = gen_captcha()
-        bot.send_message(uid, f"❌ Wrong. Try:\n{q}")
-        bot.register_next_step_handler_by_chat_id(uid, captcha_handler, a)
+def admin_panel_kb():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📊 Stats", callback_data="admin_stats")
+    builder.button(text="👥 Users", callback_data="admin_users")
+    builder.button(text="📢 Broadcast", callback_data="admin_broadcast")
+    builder.button(text="🛍 Shop Mgmt", callback_data="admin_shop")
+    builder.button(text="⚙️ Settings", callback_data="admin_settings")
+    builder.button(text="🎁 Promos", callback_data="admin_promos") 
+    builder.button(text="📋 Tasks Mgmt", callback_data="admin_tasks") 
+    builder.button(text="🗄️ Backup (Info)", callback_data="admin_backup") 
+    builder.adjust(2)
+    return builder.as_markup()
 
-def welcome(uid):
-    w = get_setting("welcome").replace("{name}", bot.get_chat(uid).first_name)
-    user = get_user(uid)
+def shop_mgmt_kb():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Add Category", callback_data="admin_add_cat")
+    builder.button(text="➕ Add Product", callback_data="admin_add_prod")
+    builder.button(text="🔙 Back", callback_data="admin_panel")
+    builder.adjust(1)
+    return builder.as_markup()
+
+# --- Handlers: Start & Captcha ---
+@router.message(CommandStart())
+async def cmd_start(message: types.Message, state: FSMContext):
+    # Add user to DB
+    args = message.text.split()
+    referrer_id = None
+    if len(args) > 1 and args[1].isdigit():
+        referrer_id_arg = int(args[1])
+        if referrer_id_arg != message.from_user.id:
+            referrer = await get_user(referrer_id_arg)
+            if referrer:
+                referrer_id = referrer_id_arg
+            
+    await add_user(message.from_user.id, message.from_user.username, message.from_user.full_name, referrer_id)
+    
+    # Check Captcha
+    captcha_enabled = await get_setting("captcha_enabled")
+    if captcha_enabled == "1":
+        num1 = random.randint(1, 10)
+        num2 = random.randint(1, 10)
+        result = num1 + num2
+        await state.update_data(captcha_result=result)
+        await state.set_state(ShopStates.captcha)
+        await message.answer(f"🔒 Security Check: What is {num1} + {num2}?", reply_markup=types.ReplyKeyboardRemove())
+    else:
+        await show_welcome(message)
+
+@router.message(ShopStates.captcha)
+async def process_captcha(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    if message.text.strip() == str(data.get("captcha_result")):
+        await state.clear()
+        await show_welcome(message)
+    else:
+        await message.answer("❌ Incorrect. Try again.")
+
+async def show_welcome(message: types.Message):
+    welcome_text = await get_setting("welcome_message")
+    user = await get_user(message.from_user.id)
+    is_admin = str(message.from_user.id) == str(ADMIN_ID)
+    
     if user and user['banned']:
-        bot.send_message(uid, "🚫 You are banned.")
+        await message.answer("🚫 You are banned from this bot.")
         return
-    bot.send_message(uid, w, reply_markup=main_menu_kb(uid), parse_mode='Markdown')
 
-# ---------- টেক্সট হ্যান্ডলার (মেনু) ----------
-@bot.message_handler(func=lambda m: m.text == "👤 Profile")
-def profile(m):
-    uid = m.chat.id
-    u = get_user(uid)
-    if not u:
-        bot.send_message(uid, "Use /start")
-        return
-    s = u['total_spent']
-    if s < 100:
-        lvl = "🥉 Bronze"
-    elif s < 500:
-        lvl = "🥈 Silver"
-    else:
-        lvl = "🥇 Gold"
-    txt = f"""👤 *Profile*
-ID: `{u['user_id']}`
-💰 Balance: {u['balance']}{get_setting('currency')}
-📊 Spent: {s}
-🏅 Level: {lvl}
-📅 Joined: {u['joined_at'][:10]}"""
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("📦 Orders", callback_data="myord"),
-        types.InlineKeyboardButton("📜 History", callback_data="myhist")
+    welcome_text = welcome_text.replace("{name}", message.from_user.full_name)
+    
+    await message.answer(
+        welcome_text,
+        reply_markup=main_menu_kb(is_admin),
+        parse_mode=ParseMode.MARKDOWN
     )
-    kb.row(types.InlineKeyboardButton("🎁 Redeem", callback_data="promo"))
-    bot.send_message(uid, txt, reply_markup=kb, parse_mode='Markdown')
-    bot_info = bot.get_me()
-    bot.send_message(uid, f"🔗 *Referral link:*\nhttps://t.me/{bot_info.username}?start={uid}", parse_mode='Markdown')
 
-@bot.message_handler(func=lambda m: m.text == "🎁 Daily")
-def daily(m):
-    uid = m.chat.id
-    if get_setting("daily_on") != "1":
-        bot.send_message(uid, "❌ Daily bonus disabled")
+# --- Handlers: Main Menu ---
+@router.message(F.text == "👤 Profile")
+async def profile(message: types.Message):
+    user = await get_user(message.from_user.id)
+    currency = await get_setting("currency")
+    
+    if not user:
+        await message.answer("User not found. Try /start")
         return
-    today = date.today().isoformat()
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT last FROM daily WHERE user_id=?", (uid,))
-    r = c.fetchone()
-    if r and r[0] == today:
-        conn.close()
-        bot.send_message(uid, "⏳ Already claimed today")
-        return
-    amt = float(get_setting("daily_amt"))
-    c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amt, uid))
-    c.execute("REPLACE INTO daily VALUES (?,?)", (uid, today))
-    c.execute("INSERT INTO tx (user_id,amount,type,desc) VALUES (?,?,'daily','Daily bonus')", (uid, amt))
-    conn.commit()
-    conn.close()
-    bot.send_message(uid, f"🎉 +{amt} Credits")
 
-@bot.message_handler(func=lambda m: m.text == "🎲 Scratch")
-def scratch(m):
-    uid = m.chat.id
-    if get_setting("scratch_on") != "1":
-        bot.send_message(uid, "❌ Scratch card disabled")
-        return
-    today = date.today().isoformat()
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT last FROM scratch WHERE user_id=?", (uid,))
-    r = c.fetchone()
-    if r and r[0] == today:
-        conn.close()
-        bot.send_message(uid, "⏳ Already scratched today")
-        return
-    rewards = [float(x) for x in get_setting("scratch_rew").split(",") if x]
-    amt = random.choice(rewards) if rewards else 10
-    c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amt, uid))
-    c.execute("REPLACE INTO scratch VALUES (?,?)", (uid, today))
-    c.execute("INSERT INTO tx (user_id,amount,type,desc) VALUES (?,?,'scratch','Scratch card')", (uid, amt))
-    conn.commit()
-    conn.close()
-    bot.send_message(uid, f"🎲 You won {amt} Credits!")
-
-@bot.message_handler(func=lambda m: m.text == "📋 Tasks")
-def tasks(m):
-    uid = m.chat.id
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM tasks WHERE id NOT IN (SELECT task_id FROM completed WHERE user_id=?)", (uid,))
-    ts = c.fetchall()
-    conn.close()
-    if not ts:
-        bot.send_message(uid, "✅ No tasks available")
-        return
-    txt = "📋 *Available tasks:*\n"
-    kb = types.InlineKeyboardMarkup()
-    for t in ts:
-        txt += f"\n🔹 {t['desc']} – {t['reward']} Credits"
-        kb.add(types.InlineKeyboardButton(f"✅ Complete #{t['id']}", callback_data=f"dotask_{t['id']}"))
-    bot.send_message(uid, txt, reply_markup=kb, parse_mode='Markdown')
-
-@bot.message_handler(func=lambda m: m.text == "ℹ️ Support")
-def support(m):
-    bot.send_message(m.chat.id, f"ℹ️ Support: {get_setting('support')}")
-
-@bot.message_handler(func=lambda m: m.text == "📜 Rules")
-def rules(m):
-    bot.send_message(m.chat.id, get_setting("rules"), parse_mode='Markdown')
-
-@bot.message_handler(func=lambda m: m.text == "🛍 Shop")
-def shop(m):
-    uid = m.chat.id
-    if get_setting("shop") != "1":
-        bot.send_message(uid, "⚠️ Shop is disabled")
-        return
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM categories")
-    cats = c.fetchall()
-    conn.close()
-    if not cats:
-        bot.send_message(uid, "📭 No categories")
-        return
-    kb = types.InlineKeyboardMarkup()
-    for cat in cats:
-        kb.add(types.InlineKeyboardButton(cat['name'], callback_data=f"cat_{cat['id']}"))
-    bot.send_message(uid, "📂 *Categories:*", reply_markup=kb, parse_mode='Markdown')
-
-@bot.message_handler(func=lambda m: m.text == "⚙️ Admin")
-def admin_panel(m):
-    if not is_admin(m.chat.id):
-        return
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("📊 Stats", callback_data="astat"),
-        types.InlineKeyboardButton("👥 Users", callback_data="auser")
+    text = (
+        f"👤 *Your Profile*\n\n"
+        f"🆔 ID: `{user['user_id']}`\n"
+        f"💰 Balance: `{user['balance']:.2f} {currency}`\n"
+        f"📅 Joined: {user['joined_at'].split(' ')[0]}\n"
     )
-    kb.row(
-        types.InlineKeyboardButton("📢 Broadcast", callback_data="abcast"),
-        types.InlineKeyboardButton("🛍 Shop", callback_data="ashop")
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📦 My Orders", callback_data="my_orders")
+    builder.button(text="🎁 Redeem Promo", callback_data="redeem_promo")
+    # Generate deep link for referral
+    bot_info = await message.bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={user['user_id']}"
+    
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.MARKDOWN)
+    await message.answer(f"🔗 *Referral Link:*\n`{ref_link}`\nShare this link to earn rewards!", parse_mode=ParseMode.MARKDOWN)
+
+@router.message(F.text == "ℹ️ Support")
+async def support(message: types.Message):
+    link = await get_setting("support_link")
+    await message.answer(f"ℹ️ Contact Support: {link}")
+
+@router.message(F.text == "📜 Rules")
+async def rules(message: types.Message):
+    rules_text = await get_setting("rules")
+    await message.answer(f"📜 *Rules*:\n\n{rules_text}", parse_mode=ParseMode.MARKDOWN)
+
+@router.message(F.text == "🛍️ Shop")
+async def shop_entry(message: types.Message):
+    shop_enabled = await get_setting("shop_enabled")
+    if shop_enabled == "0":
+        await message.answer("⚠️ Shop is currently disabled.")
+        return
+        
+    # Show Categories
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM categories") as cursor:
+            categories = await cursor.fetchall()
+            
+    if not categories:
+        await message.answer("No categories available.")
+        return
+        
+    builder = InlineKeyboardBuilder()
+    for cat in categories:
+        builder.button(text=cat['name'], callback_data=f"cat_{cat['id']}")
+    builder.adjust(2)
+    
+    await message.answer("📂 Select a Category:", reply_markup=builder.as_markup())
+
+@router.callback_query(F.data.startswith("cat_"))
+async def show_products(callback: CallbackQuery):
+    cat_id = int(callback.data.split("_")[1])
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM products WHERE category_id = ?", (cat_id,)) as cursor:
+            products = await cursor.fetchall()
+            
+    if not products:
+        await callback.message.answer("No products in this category.")
+        return
+        
+    builder = InlineKeyboardBuilder()
+    for prod in products:
+        stock_text = "∞" if prod['stock'] == -1 else prod['stock']
+        builder.button(text=f"{prod['name']} | {prod['price']:.2f} | Stock: {stock_text}", callback_data=f"prod_{prod['id']}")
+    builder.adjust(1)
+    
+    await callback.message.answer("📦 Available Products:", reply_markup=builder.as_markup())
+
+@router.callback_query(F.data.startswith("prod_"))
+async def show_product_details(callback: CallbackQuery):
+    prod_id = int(callback.data.split("_")[1])
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM products WHERE id = ?", (prod_id,)) as cursor:
+            prod = await cursor.fetchone()
+            
+    if not prod:
+        await callback.message.answer("Product not found.")
+        return
+
+    currency = await get_setting("currency")
+    text = (
+        f"📦 *{prod['name']}*\n\n"
+        f"📝 {prod['description']}\n\n"
+        f"💰 Price: `{prod['price']:.2f} {currency}`\n"
+        f"📦 Stock: `{'Unlimited' if prod['stock'] == -1 else prod['stock']}`\n"
+        f"Type: `{prod['type']}`"
     )
-    kb.row(
-        types.InlineKeyboardButton("⚙️ Settings", callback_data="aset"),
-        types.InlineKeyboardButton("🎁 Promos", callback_data="apromo")
-    )
-    kb.row(
-        types.InlineKeyboardButton("📋 Tasks", callback_data="atask"),
-        types.InlineKeyboardButton("📦 Orders", callback_data="aorder")
-    )
-    kb.row(types.InlineKeyboardButton("📦 Backup DB", callback_data="abackup"))
-    bot.send_message(m.chat.id, "🔧 *Admin Panel*", reply_markup=kb, parse_mode='Markdown')
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💳 Buy Now", callback_data=f"buy_{prod['id']}")
+    builder.button(text="🔙 Back", callback_data="shop_main") 
+    
+    await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.MARKDOWN)
 
-# ---------- কলব্যাক হ্যান্ডলার ----------
-@bot.callback_query_handler(func=lambda call: True)
-def callback_query(call):
-    data = call.data
-    uid = call.from_user.id
-    cid = call.message.chat.id
-    mid = call.message.message_id
-
-    # ----- ইউজার কলব্যাক -----
-    if data == "myhist":
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM tx WHERE user_id=? ORDER BY created DESC LIMIT 10", (uid,))
-        txs = c.fetchall()
-        conn.close()
-        if not txs:
-            bot.edit_message_text("📭 No history", cid, mid)
-            return
-        txt = "📊 *History:*\n"
-        for t in txs:
-            txt += f"\n• {t['created'][:10]} {t['type']}: {t['amount']:+} Credits"
-        bot.edit_message_text(txt, cid, mid, parse_mode='Markdown')
+@router.callback_query(F.data.startswith("buy_"))
+async def buy_product(callback: CallbackQuery):
+    prod_id = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM products WHERE id = ?", (prod_id,)) as cursor:
+            prod = await cursor.fetchone()
+        
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            user = await cursor.fetchone()
+            
+    if not prod:
+        await callback.answer("Product not found.")
         return
-
-    if data == "myord":
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("""SELECT o.*, p.name FROM orders o
-                     JOIN products p ON o.product_id=p.id
-                     WHERE user_id=? ORDER BY created DESC LIMIT 5""", (uid,))
-        orders = c.fetchall()
-        conn.close()
-        if not orders:
-            bot.edit_message_text("📭 No orders", cid, mid)
-            return
-        txt = "📦 *Recent orders:*\n"
-        for o in orders:
-            txt += f"\n🔹 {o['name']} – {o['status'].upper()}"
-        bot.edit_message_text(txt, cid, mid, parse_mode='Markdown')
+        
+    if prod['stock'] != -1 and prod['stock'] <= 0:
+        await callback.answer("Out of stock!")
         return
-
-    if data == "promo":
-        msg = bot.send_message(cid, "🎁 Enter promo code:")
-        bot.register_next_step_handler_by_chat_id(cid, promo_redeem)
+        
+    if user['balance'] < prod['price']:
+        await callback.answer("Insufficient balance!")
         return
+        
+    # Process Purchase
+    new_balance = user['balance'] - prod['price']
+    new_stock = prod['stock'] - 1 if prod['stock'] != -1 else -1
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_balance, user_id))
+        if new_stock != -1:
+            await db.execute("UPDATE products SET stock = ? WHERE id = ?", (new_stock, prod_id))
+            
+        # Record Order
+        status = "delivered" if prod['type'] in ['digital', 'file'] else "pending"
+        order_data = prod['content'] if status == "delivered" and prod['type'] != 'physical' else "Waiting for manual processing"
+        await db.execute("INSERT INTO orders (user_id, product_id, status, data) VALUES (?, ?, ?, ?)", 
+                         (user_id, prod_id, status, order_data))
+        await db.commit()
+        
+    await callback.message.answer(f"✅ Purchase Successful!\nNew Balance: {new_balance:.2f}")
+    
+    if prod['type'] == 'file':
+        try:
+            # Attempt to send as file if content is a file ID
+            await callback.message.answer_document(FSInputFile(prod['content'], filename=f"{prod['name']}.dat"))
+        except Exception:
+            # Fallback to text if file ID fails (e.g., not a valid File ID)
+            await callback.message.answer(f"📄 Here is your content/file ID: `{prod['content']}`", parse_mode=ParseMode.MARKDOWN)
+    elif prod['type'] == 'digital':
+        await callback.message.answer(f"📦 Your Item:\n`{prod['content']}`", parse_mode=ParseMode.MARKDOWN)
+    elif prod['type'] == 'physical':
+        await callback.message.answer("📦 Order placed! An admin will review it shortly.")
 
-    if data.startswith("dotask_"):
-        tid = int(data.split("_")[1])
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM tasks WHERE id=?", (tid,))
-        task = c.fetchone()
-        if not task:
-            conn.close()
-            bot.answer_callback_query(call.id, "Task not found")
-            return
-        c.execute("SELECT * FROM completed WHERE user_id=? AND task_id=?", (uid, tid))
-        if c.fetchone():
-            conn.close()
-            bot.answer_callback_query(call.id, "Already done")
-            return
-        c.execute("INSERT INTO completed VALUES (?,?)", (uid, tid))
-        c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (task['reward'], uid))
-        c.execute("INSERT INTO tx (user_id,amount,type,desc) VALUES (?,?,'task',?)", (uid, task['reward'], task['desc']))
-        conn.commit()
-        conn.close()
-        bot.edit_message_text(f"✅ Task done! +{task['reward']} Credits", cid, mid)
+@router.callback_query(F.data == "my_orders")
+async def my_orders(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT orders.*, products.name FROM orders JOIN products ON orders.product_id = products.id WHERE user_id = ? ORDER BY created_at DESC LIMIT 10", (user_id,)) as cursor:
+            orders = await cursor.fetchall()
+            
+    if not orders:
+        await callback.message.answer("No orders found.")
         return
+        
+    text = "📦 *Recent Orders:*\n\n"
+    for order in orders:
+        text += f"🔹 {order['name']} - Status: `{order['status'].upper()}`\n"
+        
+    await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
-    if data.startswith("cat_"):
-        cat_id = int(data.split("_")[1])
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM products WHERE cat_id=?", (cat_id,))
-        prods = c.fetchall()
-        conn.close()
-        if not prods:
-            bot.edit_message_text("📭 No products", cid, mid)
-            return
-        kb = types.InlineKeyboardMarkup()
-        for p in prods:
-            st = "∞" if p['stock'] == -1 else p['stock']
-            kb.add(types.InlineKeyboardButton(f"{p['name']} | {p['price']} | Stock:{st}", callback_data=f"prod_{p['id']}"))
-        bot.edit_message_text("📦 *Products:*", cid, mid, reply_markup=kb, parse_mode='Markdown')
-        return
+# --- Promo Code System ---
+@router.callback_query(F.data == "redeem_promo")
+async def redeem_promo_ask(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("🎁 Enter your Promo Code:")
+    await state.set_state(UserStates.waiting_for_promo)
 
-    if data.startswith("prod_"):
-        pid = int(data.split("_")[1])
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM products WHERE id=?", (pid,))
-        p = c.fetchone()
-        conn.close()
-        if not p:
-            bot.edit_message_text("Product not found", cid, mid)
-            return
-        txt = f"""📦 *{p['name']}*
-{p['desc']}
-💰 Price: {p['price']}{get_setting('currency')}
-📦 Stock: {'Unlimited' if p['stock']==-1 else p['stock']}
-Type: {p['type']}"""
-        kb = types.InlineKeyboardMarkup()
-        kb.row(
-            types.InlineKeyboardButton("💳 Buy", callback_data=f"buy_{p['id']}"),
-            types.InlineKeyboardButton("🔙 Back", callback_data=f"back_{p['cat_id']}")
-        )
-        bot.edit_message_text(txt, cid, mid, reply_markup=kb, parse_mode='Markdown')
-        return
-
-    if data.startswith("back_"):
-        cat_id = int(data.split("_")[1])
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM products WHERE cat_id=?", (cat_id,))
-        prods = c.fetchall()
-        conn.close()
-        kb = types.InlineKeyboardMarkup()
-        for p in prods:
-            st = "∞" if p['stock'] == -1 else p['stock']
-            kb.add(types.InlineKeyboardButton(f"{p['name']} | {p['price']} | Stock:{st}", callback_data=f"prod_{p['id']}"))
-        bot.edit_message_text("📦 *Products:*", cid, mid, reply_markup=kb, parse_mode='Markdown')
-        return
-
-    if data.startswith("buy_"):
-        pid = int(data.split("_")[1])
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM products WHERE id=?", (pid,))
-        p = c.fetchone()
-        c.execute("SELECT * FROM users WHERE user_id=?", (uid,))
-        u = c.fetchone()
-        conn.close()
-        if not p or not u:
-            bot.answer_callback_query(call.id, "Error")
-            return
-        if p['stock'] != -1 and p['stock'] <= 0:
-            bot.answer_callback_query(call.id, "Out of stock")
-            return
-        if u['balance'] < p['price']:
-            bot.answer_callback_query(call.id, "Insufficient balance")
-            return
-        if p['type'] == 'physical':
-            # ask address
-            bot.edit_message_text("📦 Please enter your shipping address:", cid, mid)
-            bot.register_next_step_handler_by_chat_id(cid, process_physical, pid)
-        else:
-            # process digital/file immediately
-            process_purchase(uid, pid, cid, mid)
-
-    # ----- অ্যাডমিন কলব্যাক -----
-    if data == "astat":
-        if not is_admin(uid): return
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM users")
-        uc = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM orders")
-        oc = c.fetchone()[0]
-        c.execute("SELECT SUM(price) FROM products JOIN orders ON products.id=orders.product_id")
-        rev = c.fetchone()[0] or 0
-        conn.close()
-        txt = f"📊 *Stats*\n👥 Users: {uc}\n📦 Orders: {oc}\n💰 Revenue: {rev}"
-        bot.edit_message_text(txt, cid, mid, parse_mode='Markdown', reply_markup=admin_panel_kb())
-        return
-
-    if data == "abackup":
-        if not is_admin(uid): return
-        bot.edit_message_text("📦 Backup feature coming soon...", cid, mid)
-        return
-
-    if data == "abcast":
-        if not is_admin(uid): return
-        bot.send_message(cid, "📝 Send message to broadcast:")
-        bot.register_next_step_handler_by_chat_id(cid, broadcast_message)
-        bot.delete_message(cid, mid)
-        return
-
-    if data == "ashop":
-        if not is_admin(uid): return
-        kb = types.InlineKeyboardMarkup()
-        kb.row(types.InlineKeyboardButton("➕ Add Category", callback_data="acat"))
-        kb.row(types.InlineKeyboardButton("📋 List Categories", callback_data="lcat"))
-        kb.row(types.InlineKeyboardButton("🔙 Back", callback_data="apanel"))
-        bot.edit_message_text("🛍 *Shop Management*", cid, mid, reply_markup=kb, parse_mode='Markdown')
-        return
-
-    if data == "auser":
-        if not is_admin(uid): return
-        kb = types.InlineKeyboardMarkup()
-        kb.row(types.InlineKeyboardButton("🔎 Search User", callback_data="usearch"))
-        kb.row(types.InlineKeyboardButton("📋 List Users", callback_data="ulist"))
-        bot.edit_message_text("👥 *User Management*", cid, mid, reply_markup=kb, parse_mode='Markdown')
-        return
-
-    if data == "aset":
-        if not is_admin(uid): return
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        settings_list = [
-            ("Welcome", "set_welcome"),
-            ("Currency", "set_currency"),
-            ("Support", "set_support"),
-            ("Rules", "set_rules"),
-            ("Channel", "set_channel"),
-            ("Captcha", "set_captcha"),
-            ("Shop", "set_shop"),
-            ("Referral", "set_referral"),
-            ("Daily Amt", "set_daily_amt"),
-            ("Daily On", "set_daily_on"),
-            ("Scratch Rew", "set_scratch_rew"),
-            ("Scratch On", "set_scratch_on"),
-        ]
-        for name, cb in settings_list:
-            kb.add(types.InlineKeyboardButton(name, callback_data=cb))
-        kb.add(types.InlineKeyboardButton("🔙 Back", callback_data="apanel"))
-        bot.edit_message_text("⚙️ *Settings*", cid, mid, reply_markup=kb, parse_mode='Markdown')
-        return
-
-    if data == "apromo":
-        if not is_admin(uid): return
-        kb = types.InlineKeyboardMarkup()
-        kb.row(types.InlineKeyboardButton("➕ Create Promo", callback_data="cpromo"))
-        kb.row(types.InlineKeyboardButton("📋 List Promos", callback_data="lpromo"))
-        bot.edit_message_text("🎁 *Promo Management*", cid, mid, reply_markup=kb, parse_mode='Markdown')
-        return
-
-    if data == "atask":
-        if not is_admin(uid): return
-        kb = types.InlineKeyboardMarkup()
-        kb.row(types.InlineKeyboardButton("➕ Create Task", callback_data="ctask"))
-        kb.row(types.InlineKeyboardButton("📋 List Tasks", callback_data="ltask"))
-        bot.edit_message_text("📋 *Task Management*", cid, mid, reply_markup=kb, parse_mode='Markdown')
-        return
-
-    if data == "aorder":
-        if not is_admin(uid): return
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("""SELECT o.*, p.name FROM orders o
-                     JOIN products p ON o.product_id=p.id
-                     WHERE status='pending'""")
-        orders = c.fetchall()
-        conn.close()
-        if not orders:
-            bot.edit_message_text("📭 No pending orders", cid, mid)
-            return
-        for o in orders:
-            txt = f"📦 Order #{o['id']}\nProduct: {o['name']}\nUser: {o['user_id']}\nData: {o['data']}"
-            kb = types.InlineKeyboardMarkup()
-            kb.add(types.InlineKeyboardButton("✅ Deliver", callback_data=f"deliver_{o['id']}"))
-            bot.send_message(uid, txt, reply_markup=kb)
-        bot.delete_message(cid, mid)
-        return
-
-    if data.startswith("deliver_"):
-        if not is_admin(uid): return
-        oid = int(data.split("_")[1])
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("UPDATE orders SET status='delivered' WHERE id=?", (oid,))
-        conn.commit()
-        conn.close()
-        bot.edit_message_text(f"✅ Order #{oid} delivered", cid, mid)
-        return
-
-    if data == "apanel":
-        if not is_admin(uid): return
-        bot.delete_message(cid, mid)
-        admin_panel(call.message)
-        return
-
-    if data == "acat":
-        if not is_admin(uid): return
-        msg = bot.send_message(cid, "📝 Enter category name:")
-        bot.register_next_step_handler_by_chat_id(cid, add_category)
-        bot.delete_message(cid, mid)
-        return
-
-    if data == "lcat":
-        if not is_admin(uid): return
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM categories")
-        cats = c.fetchall()
-        conn.close()
-        if not cats:
-            bot.edit_message_text("📭 No categories", cid, mid)
-            return
-        kb = types.InlineKeyboardMarkup()
-        for cat in cats:
-            kb.row(
-                types.InlineKeyboardButton(f"📁 {cat['name']}", callback_data=f"catadm_{cat['id']}"),
-                types.InlineKeyboardButton("✏️", callback_data=f"ecat_{cat['id']}"),
-                types.InlineKeyboardButton("🗑️", callback_data=f"dcat_{cat['id']}")
-            )
-        kb.row(types.InlineKeyboardButton("🔙 Back", callback_data="ashop"))
-        bot.edit_message_text("📂 *Categories:*", cid, mid, reply_markup=kb, parse_mode='Markdown')
-        return
-
-    if data.startswith("catadm_"):
-        if not is_admin(uid): return
-        cat_id = int(data.split("_")[1])
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM products WHERE cat_id=?", (cat_id,))
-        prods = c.fetchall()
-        conn.close()
-        kb = types.InlineKeyboardMarkup()
-        for p in prods:
-            kb.row(
-                types.InlineKeyboardButton(f"{p['name']} | {p['price']}", callback_data=f"prod_{p['id']}"),
-                types.InlineKeyboardButton("✏️", callback_data=f"eprod_{p['id']}"),
-                types.InlineKeyboardButton("🗑️", callback_data=f"dprod_{p['id']}")
-            )
-        kb.row(types.InlineKeyboardButton("➕ Add Product", callback_data=f"aprod_{cat_id}"))
-        kb.row(types.InlineKeyboardButton("🔙 Back", callback_data="lcat"))
-        bot.edit_message_text("📦 *Products:*", cid, mid, reply_markup=kb, parse_mode='Markdown')
-        return
-
-    if data.startswith("ecat_"):
-        if not is_admin(uid): return
-        cat_id = int(data.split("_")[1])
-        msg = bot.send_message(cid, "✏️ Enter new name:")
-        bot.register_next_step_handler_by_chat_id(cid, edit_category, cat_id)
-        bot.delete_message(cid, mid)
-        return
-
-    if data.startswith("dcat_"):
-        if not is_admin(uid): return
-        cat_id = int(data.split("_")[1])
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("DELETE FROM categories WHERE id=?", (cat_id,))
-        conn.commit()
-        conn.close()
-        bot.edit_message_text("🗑️ Category deleted", cid, mid)
-        return
-
-    if data.startswith("aprod_"):
-        if not is_admin(uid): return
-        cat_id = int(data.split("_")[1])
-        bot.send_message(cid, "📝 Enter product name:")
-        bot.register_next_step_handler_by_chat_id(cid, add_product_name, cat_id)
-        bot.delete_message(cid, mid)
-        return
-
-    if data.startswith("eprod_"):
-        if not is_admin(uid): return
-        prod_id = int(data.split("_")[1])
-        kb = types.InlineKeyboardMarkup()
-        kb.row(
-            types.InlineKeyboardButton("Name", callback_data=f"en_{prod_id}"),
-            types.InlineKeyboardButton("Desc", callback_data=f"ed_{prod_id}")
-        )
-        kb.row(
-            types.InlineKeyboardButton("Price", callback_data=f"ep_{prod_id}"),
-            types.InlineKeyboardButton("Stock", callback_data=f"es_{prod_id}")
-        )
-        kb.row(
-            types.InlineKeyboardButton("Content", callback_data=f"ec_{prod_id}"),
-            types.InlineKeyboardButton("Type", callback_data=f"et_{prod_id}")
-        )
-        bot.edit_message_text("✏️ *Edit product:*", cid, mid, reply_markup=kb, parse_mode='Markdown')
-        return
-
-    if data.startswith(("en_","ed_","ep_","es_","ec_","et_")):
-        if not is_admin(uid): return
-        parts = data.split("_")
-        field = parts[0]
-        prod_id = int(parts[1])
-        field_map = {"en":"name","ed":"desc","ep":"price","es":"stock","ec":"content","et":"type"}
-        fld = field_map[field]
-        msg = bot.send_message(cid, f"✏️ Enter new value for {fld}:")
-        bot.register_next_step_handler_by_chat_id(msg.chat.id, update_product_field, prod_id, fld)
-        bot.delete_message(cid, mid)
-        return
-
-    if data.startswith("dprod_"):
-        if not is_admin(uid): return
-        prod_id = int(data.split("_")[1])
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("DELETE FROM products WHERE id=?", (prod_id,))
-        conn.commit()
-        conn.close()
-        bot.edit_message_text("🗑️ Product deleted", cid, mid)
-        return
-
-    if data == "usearch":
-        if not is_admin(uid): return
-        msg = bot.send_message(cid, "🆔 Enter user ID or username:")
-        bot.register_next_step_handler_by_chat_id(cid, search_user)
-        bot.delete_message(cid, mid)
-        return
-
-    if data == "ulist":
-        if not is_admin(uid): return
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT user_id, full_name, balance FROM users LIMIT 20")
-        us = c.fetchall()
-        conn.close()
-        txt = "👥 *Users (first 20):*\n"
-        for u in us:
-            txt += f"\n`{u['user_id']}` | {u['full_name']} | {u['balance']}"
-        bot.edit_message_text(txt, cid, mid, parse_mode='Markdown')
-        return
-
-    if data.startswith("ban_"):
-        if not is_admin(uid): return
-        target = int(data.split("_")[1])
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("SELECT banned FROM users WHERE user_id=?", (target,))
-        row = c.fetchone()
-        new = 0 if row[0] else 1
-        c.execute("UPDATE users SET banned=? WHERE user_id=?", (new, target))
-        conn.commit()
-        conn.close()
-        bot.answer_callback_query(call.id, f"User {'banned' if new else 'unbanned'}")
-        bot.delete_message(cid, mid)
-        return
-
-    if data == "cpromo":
-        if not is_admin(uid): return
-        msg = bot.send_message(cid, "📝 Enter promo code:")
-        bot.register_next_step_handler_by_chat_id(cid, add_promo_code)
-        bot.delete_message(cid, mid)
-        return
-
-    if data == "lpromo":
-        if not is_admin(uid): return
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM promos")
-        ps = c.fetchall()
-        conn.close()
-        if not ps:
-            bot.edit_message_text("📭 No promos", cid, mid)
-            return
-        for p in ps:
-            txt = f"Code: `{p['code']}`\nReward: {p['reward']}\nUsed: {p['used']}/{p['max_use']}\nExpiry: {p['expiry']}"
-            kb = types.InlineKeyboardMarkup()
-            kb.add(types.InlineKeyboardButton("🗑️ Delete", callback_data=f"dpromo_{p['code']}"))
-            bot.send_message(uid, txt, reply_markup=kb, parse_mode='Markdown')
-        bot.delete_message(cid, mid)
-        return
-
-    if data.startswith("dpromo_"):
-        if not is_admin(uid): return
-        code = data.split("_")[1]
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("DELETE FROM promos WHERE code=?", (code,))
-        conn.commit()
-        conn.close()
-        bot.edit_message_text("🗑️ Promo deleted", cid, mid)
-        return
-
-    if data == "ctask":
-        if not is_admin(uid): return
-        msg = bot.send_message(cid, "📝 Enter task description:")
-        bot.register_next_step_handler_by_chat_id(cid, add_task_desc)
-        bot.delete_message(cid, mid)
-        return
-
-    if data == "ltask":
-        if not is_admin(uid): return
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM tasks")
-        ts = c.fetchall()
-        conn.close()
-        if not ts:
-            bot.edit_message_text("📭 No tasks", cid, mid)
-            return
-        for t in ts:
-            txt = f"ID: {t['id']}\nDesc: {t['desc']}\nLink: {t['link']}\nReward: {t['reward']}"
-            kb = types.InlineKeyboardMarkup()
-            kb.add(types.InlineKeyboardButton("🗑️ Delete", callback_data=f"dtask_{t['id']}"))
-            bot.send_message(uid, txt, reply_markup=kb)
-        bot.delete_message(cid, mid)
-        return
-
-    if data.startswith("dtask_"):
-        if not is_admin(uid): return
-        tid = int(data.split("_")[1])
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("DELETE FROM tasks WHERE id=?", (tid,))
-        conn.commit()
-        conn.close()
-        bot.edit_message_text("🗑️ Task deleted", cid, mid)
-        return
-
-    # ----- settings callbacks -----
-    if data.startswith("set_"):
-        if not is_admin(uid): return
-        key = data.replace("set_", "")
-        msg = bot.send_message(cid, f"✏️ Enter new value for `{key}`:", parse_mode='Markdown')
-        bot.register_next_step_handler_by_chat_id(cid, update_setting, key)
-        bot.delete_message(cid, mid)
-        return
-
-# ---------- প্রোমো রিডিম ----------
-def promo_redeem(message):
-    uid = message.chat.id
+@router.message(UserStates.waiting_for_promo)
+async def redeem_promo_process(message: types.Message, state: FSMContext):
     code = message.text.strip()
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM promos WHERE code=?", (code,))
-    p = c.fetchone()
-    if not p:
-        conn.close()
-        bot.send_message(uid, "❌ Invalid code")
-        return
-    if p['expiry'] and p['expiry'] < datetime.now().strftime("%Y-%m-%d"):
-        conn.close()
-        bot.send_message(uid, "❌ Code expired")
-        return
-    if p['max_use'] != -1 and p['used'] >= p['max_use']:
-        conn.close()
-        bot.send_message(uid, "❌ Usage limit reached")
-        return
-    c.execute("SELECT * FROM promo_used WHERE user_id=? AND code=?", (uid, code))
-    if c.fetchone():
-        conn.close()
-        bot.send_message(uid, "❌ Already used")
-        return
-    c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (p['reward'], uid))
-    c.execute("UPDATE promos SET used=used+1 WHERE code=?", (code,))
-    c.execute("INSERT INTO promo_used VALUES (?,?)", (uid, code))
-    c.execute("INSERT INTO tx (user_id,amount,type,desc) VALUES (?,?,'promo',?)", (uid, p['reward'], code))
-    conn.commit()
-    conn.close()
-    bot.send_message(uid, f"✅ Redeemed! +{p['reward']} Credits")
+    user_id = message.from_user.id
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM promos WHERE code = ?", (code,)) as cursor:
+            promo = await cursor.fetchone()
+            
+        if not promo:
+            await message.answer("❌ Invalid code.")
+            await state.clear()
+            return
 
-# ---------- ফিজিক্যাল প্রোডাক্টের জন্য ----------
-def process_physical(message, pid):
-    uid = message.chat.id
-    addr = message.text
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM products WHERE id=?", (pid,))
-    p = c.fetchone()
-    c.execute("SELECT * FROM users WHERE user_id=?", (uid,))
-    u = c.fetchone()
-    if not p or not u:
-        conn.close()
-        bot.send_message(uid, "Error")
-        return
-    if p['stock'] != -1 and p['stock'] <= 0:
-        bot.send_message(uid, "Out of stock")
-        return
-    if u['balance'] < p['price']:
-        bot.send_message(uid, "Insufficient balance")
-        return
-    new_bal = u['balance'] - p['price']
-    new_stock = p['stock']-1 if p['stock']!=-1 else -1
-    c.execute("UPDATE users SET balance=?, total_spent=total_spent+? WHERE user_id=?", (new_bal, p['price'], uid))
-    if new_stock != -1:
-        c.execute("UPDATE products SET stock=? WHERE id=?", (new_stock, pid))
-    c.execute("INSERT INTO orders (user_id,product_id,status,data) VALUES (?,?,'pending',?)", (uid, pid, addr))
-    c.execute("INSERT INTO tx (user_id,amount,type,desc) VALUES (?,?,'purchase',?)", (uid, -p['price'], p['name']))
-    conn.commit()
-    conn.close()
-    bot.send_message(uid, f"✅ Order placed! Balance: {new_bal} Credits")
+        # Check usages
+        if promo['max_usage'] != -1 and promo['used_count'] >= promo['max_usage']:
+            await message.answer("❌ Code limit reached.")
+            await state.clear()
+            return
+            
+        # Check if already used
+        async with db.execute("SELECT * FROM promo_usage WHERE user_id = ? AND code = ?", (user_id, code)) as cursor:
+            if await cursor.fetchone():
+                await message.answer("❌ You already used this code.")
+                await state.clear()
+                return
+                
+        # Apply reward
+        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (promo['reward'], user_id))
+        await db.execute("UPDATE promos SET used_count = used_count + 1 WHERE code = ?", (code,))
+        await db.execute("INSERT INTO promo_usage (user_id, code) VALUES (?, ?)", (user_id, code))
+        await db.commit()
+        
+    await message.answer(f"✅ Code Redeemed! Added {promo['reward']:.2f} to your balance.")
+    await state.clear()
 
-# ---------- ডিজিটাল/ফাইল কেনার প্রক্রিয়া ----------
-def process_purchase(uid, pid, cid, mid):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM products WHERE id=?", (pid,))
-    p = c.fetchone()
-    c.execute("SELECT * FROM users WHERE user_id=?", (uid,))
-    u = c.fetchone()
-    if not p or not u:
-        conn.close()
-        bot.send_message(uid, "Error")
+# --- Task System ---
+@router.message(F.text == "📋 Tasks")
+async def tasks_list(message: types.Message):
+    user_id = message.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        # Get tasks not completed by user
+        async with db.execute("""
+            SELECT * FROM tasks 
+            WHERE id NOT IN (SELECT task_id FROM completed_tasks WHERE user_id = ?)
+        """, (user_id,)) as cursor:
+            tasks = await cursor.fetchall()
+            
+    if not tasks:
+        await message.answer("✅ No new tasks available.")
         return
-    if p['stock'] != -1 and p['stock'] <= 0:
-        bot.send_message(uid, "Out of stock")
+        
+    text = "📋 *Available Tasks:*\n\n"
+    builder = InlineKeyboardBuilder()
+    
+    for task in tasks:
+        text += f"🔹 {task['description']} - Reward: {task['reward']:.2f}\n"
+        builder.button(text=f"✅ Complete: {task['description'][:15]}...", callback_data=f"do_task_{task['id']}")
+        
+    builder.adjust(1)
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.MARKDOWN)
+
+@router.callback_query(F.data.startswith("do_task_"))
+async def do_task(callback: CallbackQuery):
+    task_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)) as cursor:
+            task = await cursor.fetchone()
+            
+        if not task:
+            await callback.answer("Task not found.")
+            return
+            
+        # Check if already completed
+        async with db.execute("SELECT * FROM completed_tasks WHERE user_id = ? AND task_id = ?", (user_id, task_id)) as cursor:
+            if await cursor.fetchone():
+                await callback.answer("Already completed!")
+                return
+                
+        await db.execute("INSERT INTO completed_tasks (user_id, task_id) VALUES (?, ?)", (user_id, task_id))
+        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (task['reward'], user_id))
+        await db.commit()
+        
+    await callback.message.answer(f"✅ Task Completed! Reward: {task['reward']:.2f}")
+
+# --- Daily Bonus System ---
+@router.message(F.text == "🎁 Daily Bonus")
+async def daily_bonus_entry(message: types.Message, state: FSMContext):
+    daily_enabled = await get_setting("daily_enabled")
+    if daily_enabled != "1":
+        await message.answer("The Daily Bonus feature is currently disabled by admin.")
         return
-    if u['balance'] < p['price']:
-        bot.send_message(uid, "Insufficient balance")
+    await state.set_state(UserStates.waiting_for_daily_claim)
+    await process_daily_claim(message, state)
+
+@router.message(UserStates.waiting_for_daily_claim)
+async def process_daily_claim(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    now = datetime.now()
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        user = await get_user(user_id)
+        if not user:
+            await message.answer("User not found. Please use /start.")
+            return
+            
+        last_claim = user['last_daily_claim']
+        reward = float(await get_setting("daily_reward") or 0.0)
+        
+        if last_claim:
+            last_claim_dt = datetime.strptime(last_claim, '%Y-%m-%d %H:%M:%S.%f')
+            # Check if 24 hours have passed (Simple 24h check)
+            if (now - last_claim_dt).total_seconds() < 86400: # 24 * 60 * 60
+                await message.answer("You have already claimed today's bonus. Try again tomorrow!")
+                return
+
+        # Grant reward
+        await db.execute("UPDATE users SET balance = balance + ?, last_daily_claim = ? WHERE user_id = ?", 
+                         (reward, now.strftime('%Y-%m-%d %H:%M:%S.%f'), user_id))
+        await db.commit()
+        
+    await message.answer(f"🎉 You claimed your Daily Bonus! Added: {reward:.2f}")
+
+# --- Scratch Card System ---
+@router.message(F.text == "✨ Scratch Card")
+async def scratch_card_entry(message: types.Message, state: FSMContext):
+    scratch_enabled = await get_setting("scratch_enabled")
+    if scratch_enabled != "1":
+        await message.answer("The Scratch Card feature is currently disabled by admin.")
         return
-    new_bal = u['balance'] - p['price']
-    new_stock = p['stock']-1 if p['stock']!=-1 else -1
-    c.execute("UPDATE users SET balance=?, total_spent=total_spent+? WHERE user_id=?", (new_bal, p['price'], uid))
-    if new_stock != -1:
-        c.execute("UPDATE products SET stock=? WHERE id=?", (new_stock, pid))
-    status = "delivered" if p['type'] in ('digital','file') else "pending"
-    data = p['content'] if status == "delivered" else ""
-    c.execute("INSERT INTO orders (user_id,product_id,status,data) VALUES (?,?,?,?)", (uid, pid, status, data))
-    c.execute("INSERT INTO tx (user_id,amount,type,desc) VALUES (?,?,'purchase',?)", (uid, -p['price'], p['name']))
-    conn.commit()
-    conn.close()
-    bot.send_message(uid, f"✅ Purchase successful! Balance: {new_bal} Credits")
-    if p['type'] == 'file':
+    await state.set_state(UserStates.waiting_for_scratch_claim)
+    await process_scratch_claim(message, state)
+
+@router.message(UserStates.waiting_for_scratch_claim)
+async def process_scratch_claim(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    now = datetime.now()
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        user = await get_user(user_id)
+        if not user:
+            await message.answer("User not found. Please use /start.")
+            return
+            
+        last_claim = user['last_scratch_claim']
+        
+        if last_claim:
+            last_claim_dt = datetime.strptime(last_claim, '%Y-%m-%d %H:%M:%S.%f')
+            # Simple 24h check for scratch card
+            if (now - last_claim_dt).total_seconds() < 86400: 
+                await message.answer("You have already scratched today. Try again tomorrow!")
+                return
+
+        # Determine Reward
+        rewards_str = await get_setting("scratch_rewards")
+        if not rewards_str:
+             await message.answer("Scratch rewards are not set up.")
+             return
+             
+        rewards = [float(r.strip()) for r in rewards_str.split(',') if r.strip()]
+        if not rewards:
+            await message.answer("Scratch rewards list is empty.")
+            return
+            
+        reward = random.choice(rewards)
+
+        # Grant reward
+        await db.execute("UPDATE users SET balance = balance + ?, last_scratch_claim = ? WHERE user_id = ?", 
+                         (reward, now.strftime('%Y-%m-%d %H:%M:%S.%f'), user_id))
+        await db.commit()
+        
+    await message.answer(f"✨ You scratched and won: {reward:.2f}!\nAdded to your balance.", 
+                         reply_markup=main_menu_kb(str(user_id) == str(ADMIN_ID)))
+
+# --- Admin Handlers ---
+@router.message(F.text == "⚙️ Admin Panel")
+async def admin_panel_entry(message: types.Message):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+    await message.answer("🔧 Admin Control Center", reply_markup=admin_panel_kb())
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cursor:
+            total_users = (await cursor.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM orders WHERE status != 'pending'") as cursor:
+            total_completed_orders = (await cursor.fetchone())[0]
+        async with db.execute("SELECT SUM(price) FROM products JOIN orders ON products.id = orders.product_id WHERE orders.status != 'pending'") as cursor:
+            revenue = (await cursor.fetchone())[0] or 0.0
+        async with db.execute("SELECT SUM(balance) FROM users") as cursor:
+            total_balance_distributed = (await cursor.fetchone())[0] or 0.0
+            
+    text = (
+        "📊 *Live Statistics*\n\n"
+        f"👥 Total Users: `{total_users}`\n"
+        f"✅ Completed Orders: `{total_completed_orders}`\n"
+        f"💰 Total Revenue (from Sales): `{revenue:.2f}`\n"
+        f"🪙 Total Balance Distributed: `{total_balance_distributed:.2f}`\n"
+    )
+    await callback.message.edit_text(text, reply_markup=admin_panel_kb(), parse_mode=ParseMode.MARKDOWN)
+
+@router.callback_query(F.data == "admin_backup")
+async def admin_backup_info(callback: CallbackQuery):
+    backup_link = await get_setting("backup_link")
+    text = (
+        "🗄️ *Database Backup*\n\n"
+        "Currently, the bot automatically backs up to `shop_bot.db`.\n\n"
+        f"Admin Backup Link (Placeholder): `{backup_link}`\n\n"
+        "To run a manual backup or use a cloud service, you need to implement external logic (e.g., uploading the DB file to a file host or cloud storage)."
+    )
+    await callback.message.edit_text(text, reply_markup=admin_panel_kb(), parse_mode=ParseMode.MARKDOWN)
+
+@router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_ask(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("📝 Send the message you want to broadcast (Text, Photo, or Video):")
+    await state.set_state(AdminStates.waiting_for_broadcast)
+
+@router.message(AdminStates.waiting_for_broadcast)
+async def admin_broadcast_send(message: types.Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    msg = await message.answer("⏳ Starting broadcast...")
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM users") as cursor:
+            users = await cursor.fetchall()
+            
+    count = 0
+    fail_count = 0
+    for user in users:
         try:
-            bot.send_document(uid, p['content'], caption=p['name'])
-        except:
-            bot.send_message(uid, "❌ Failed to deliver file. Contact admin.")
-    elif p['type'] == 'digital':
-        bot.send_message(uid, f"📦 Your item:\n`{p['content']}`", parse_mode='Markdown')
-
-# ---------- অ্যাডমিন ব্রডকাস্ট ----------
-def broadcast_message(message):
-    uid = message.chat.id
-    if not is_admin(uid):
-        return
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM users")
-    users = c.fetchall()
-    conn.close()
-    success = 0
-    for (user_id,) in users:
-        try:
-            bot.copy_message(user_id, uid, message.message_id)
-            success += 1
-        except:
+            # Copy message to user
+            await message.copy_to(user[0])
+            count += 1
+            if count % 20 == 0:
+                await asyncio.sleep(1) # Rate limiting
+        except Exception:
+            fail_count += 1
             pass
-    bot.send_message(uid, f"✅ Broadcast sent to {success} users")
+            
+    await msg.edit_text(f"✅ Broadcast finished. Sent successfully to {count} users. Failed for {fail_count} users.")
 
-# ---------- অ্যাডমিন ক্যাটাগরি ----------
-def add_category(message):
-    uid = message.chat.id
-    if not is_admin(uid):
-        return
+@router.callback_query(F.data == "admin_shop")
+async def admin_shop_menu(callback: CallbackQuery):
+    await callback.message.edit_text("🛍 Shop Management", reply_markup=shop_mgmt_kb())
+
+@router.callback_query(F.data == "admin_add_cat")
+async def admin_add_cat(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("📝 Enter new Category Name:")
+    await state.set_state(AdminStates.waiting_for_category_name)
+
+@router.message(AdminStates.waiting_for_category_name)
+async def admin_save_cat(message: types.Message, state: FSMContext):
     name = message.text
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (name,))
-    conn.commit()
-    conn.close()
-    bot.send_message(uid, f"✅ Category '{name}' added")
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (name,))
+        await db.commit()
+    await message.answer(f"✅ Category '{name}' added.")
+    await state.clear()
 
-def edit_category(message, cat_id):
-    uid = message.chat.id
-    if not is_admin(uid):
+@router.callback_query(F.data == "admin_add_prod")
+async def admin_add_prod_start(callback: CallbackQuery, state: FSMContext):
+    # Fetch categories
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM categories") as cursor:
+            categories = await cursor.fetchall()
+            
+    if not categories:
+        await callback.message.answer("Please add a category first using '➕ Add Category'.")
         return
-    new_name = message.text
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("UPDATE categories SET name=? WHERE id=?", (new_name, cat_id))
-    conn.commit()
-    conn.close()
-    bot.send_message(uid, "✅ Category updated")
 
-# ---------- অ্যাডমিন প্রোডাক্ট ----------
-def add_product_name(message, cat_id):
-    uid = message.chat.id
-    if not is_admin(uid):
-        return
-    name = message.text
-    bot.send_message(uid, "📝 Enter description:")
-    bot.register_next_step_handler_by_chat_id(uid, add_product_desc, cat_id, name)
+    builder = ReplyKeyboardBuilder()
+    for cat in categories:
+        builder.button(text=cat['name'])
+    builder.adjust(2)
+    
+    await callback.message.answer("📂 Select Category for new product:", reply_markup=builder.as_markup(one_time_keyboard=True, resize_keyboard=True))
+    await state.set_state(AdminStates.waiting_for_product_category)
 
-def add_product_desc(message, cat_id, name):
-    uid = message.chat.id
-    desc = message.text
-    bot.send_message(uid, "💰 Enter price:")
-    bot.register_next_step_handler_by_chat_id(uid, add_product_price, cat_id, name, desc)
+@router.message(AdminStates.waiting_for_product_category)
+async def admin_prod_cat_selected(message: types.Message, state: FSMContext):
+    cat_name = message.text
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id FROM categories WHERE name = ?", (cat_name,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                await message.answer("Invalid Category. Please select from the keyboard.")
+                return
+            cat_id = row[0]
+            
+    await state.update_data(cat_id=cat_id)
+    await message.answer("📝 Product Name:", reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(AdminStates.waiting_for_product_name)
 
-def add_product_price(message, cat_id, name, desc):
-    uid = message.chat.id
+@router.message(AdminStates.waiting_for_product_name)
+async def admin_prod_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("📝 Description:")
+    await state.set_state(AdminStates.waiting_for_product_desc)
+
+@router.message(AdminStates.waiting_for_product_desc)
+async def admin_prod_desc(message: types.Message, state: FSMContext):
+    await state.update_data(desc=message.text)
+    await message.answer("💰 Price:")
+    await state.set_state(AdminStates.waiting_for_product_price)
+
+@router.message(AdminStates.waiting_for_product_price)
+async def admin_prod_price(message: types.Message, state: FSMContext):
     try:
         price = float(message.text)
-    except:
-        bot.send_message(uid, "❌ Invalid price. Try again:")
-        bot.register_next_step_handler_by_chat_id(uid, add_product_price, cat_id, name, desc)
-        return
-    bot.send_message(uid, "📦 Enter type (digital/file/physical):")
-    bot.register_next_step_handler_by_chat_id(uid, add_product_type, cat_id, name, desc, price)
+        await state.update_data(price=price)
+        
+        builder = ReplyKeyboardBuilder()
+        builder.button(text="digital")
+        builder.button(text="file")
+        builder.button(text="physical")
+        builder.adjust(3)
+        
+        await message.answer("📦 Product Type:", reply_markup=builder.as_markup(one_time_keyboard=True, resize_keyboard=True))
+        await state.set_state(AdminStates.waiting_for_product_type)
+    except ValueError:
+        await message.answer("Invalid price. Enter a number.")
 
-def add_product_type(message, cat_id, name, desc, price):
-    uid = message.chat.id
+@router.message(AdminStates.waiting_for_product_type)
+async def admin_prod_type(message: types.Message, state: FSMContext):
     ptype = message.text.lower()
-    if ptype not in ('digital','file','physical'):
-        bot.send_message(uid, "❌ Invalid type. Choose digital/file/physical:")
-        bot.register_next_step_handler_by_chat_id(uid, add_product_type, cat_id, name, desc, price)
+    if ptype not in ['digital', 'file', 'physical']:
+        await message.answer("Invalid type. Select from the keyboard.")
         return
+        
+    await state.update_data(type=ptype)
+    
     if ptype == 'physical':
-        bot.send_message(uid, "📦 Enter stock (-1 for unlimited):")
-        bot.register_next_step_handler_by_chat_id(uid, add_product_stock, cat_id, name, desc, price, ptype, "Physical item")
+        # Skip content input for physical, use placeholder
+        await state.update_data(content="Physical Item: Awaiting user data/manual fulfillment.")
+        await message.answer("📦 Stock amount (-1 for unlimited):", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(AdminStates.waiting_for_product_stock)
     else:
-        bot.send_message(uid, "📄 Enter content (text or upload file):")
-        bot.register_next_step_handler_by_chat_id(uid, add_product_content, cat_id, name, desc, price, ptype)
+        await message.answer("📄 Content (Text for digital, Send the File/Photo for file type, or enter File ID):", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(AdminStates.waiting_for_product_content)
 
-def add_product_content(message, cat_id, name, desc, price, ptype):
-    uid = message.chat.id
+@router.message(AdminStates.waiting_for_product_content)
+async def admin_prod_content(message: types.Message, state: FSMContext):
+    content = ""
     if message.document:
         content = message.document.file_id
     elif message.photo:
         content = message.photo[-1].file_id
-    else:
-        content = message.text or "No content"
-    bot.send_message(uid, "📦 Enter stock (-1 for unlimited):")
-    bot.register_next_step_handler_by_chat_id(uid, add_product_stock, cat_id, name, desc, price, ptype, content)
+    elif message.text:
+        content = message.text 
+    
+    if not content:
+        await message.answer("Please send a file/photo or paste the content/File ID.")
+        return
+        
+    await state.update_data(content=content)
+    await message.answer("📦 Stock amount (-1 for unlimited):")
+    await state.set_state(AdminStates.waiting_for_product_stock)
 
-def add_product_stock(message, cat_id, name, desc, price, ptype, content):
-    uid = message.chat.id
+@router.message(AdminStates.waiting_for_product_stock)
+async def admin_prod_stock(message: types.Message, state: FSMContext):
     try:
         stock = int(message.text)
-    except:
-        bot.send_message(uid, "❌ Invalid stock. Enter integer:")
-        bot.register_next_step_handler_by_chat_id(uid, add_product_stock, cat_id, name, desc, price, ptype, content)
-        return
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("""INSERT INTO products (cat_id, type, name, desc, price, content, stock)
-                 VALUES (?,?,?,?,?,?,?)""", (cat_id, ptype, name, desc, price, content, stock))
-    conn.commit()
-    conn.close()
-    bot.send_message(uid, "✅ Product added!")
+        data = await state.get_data()
+        
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("""
+                INSERT INTO products (category_id, name, description, price, type, content, stock)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (data['cat_id'], data['name'], data['desc'], data['price'], data['type'], data['content'], stock))
+            await db.commit()
+            
+        await message.answer("✅ Product Added!", reply_markup=admin_panel_kb())
+        await state.clear()
+    except ValueError:
+        await message.answer("Invalid stock. Enter an integer (-1 for unlimited).")
 
-def update_product_field(message, prod_id, field):
-    uid = message.chat.id
-    val = message.text
-    if field in ('price','stock'):
-        try:
-            val = float(val) if field=='price' else int(val)
-        except:
-            bot.send_message(uid, "❌ Invalid number. Try again:")
-            bot.register_next_step_handler_by_chat_id(uid, update_product_field, prod_id, field)
-            return
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(f"UPDATE products SET {field}=? WHERE id=?", (val, prod_id))
-    conn.commit()
-    conn.close()
-    bot.send_message(uid, "✅ Product updated")
+@router.callback_query(F.data == "admin_users")
+async def admin_users_menu(callback: CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔎 Search User", callback_data="admin_search_user")
+    builder.adjust(1)
+    await callback.message.edit_text("👥 User Management", reply_markup=builder.as_markup())
 
-# ---------- অ্যাডমিন ইউজার সার্চ ----------
-def search_user(message):
-    uid = message.chat.id
-    if not is_admin(uid):
+@router.callback_query(F.data == "admin_search_user")
+async def admin_search_user(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("🆔 Enter User ID or Username:")
+    await state.set_state(AdminStates.waiting_for_user_search)
+
+@router.message(AdminStates.waiting_for_user_search)
+async def admin_show_user(message: types.Message, state: FSMContext):
+    query = message.text.strip().replace("@", "")
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        if query.isdigit():
+            sql = "SELECT * FROM users WHERE user_id = ?"
+            params = (int(query),)
+        else:
+            sql = "SELECT * FROM users WHERE username = ?"
+            params = (query,)
+            
+        async with db.execute(sql, params) as cursor:
+            user = await cursor.fetchone()
+            
+    if not user:
+        await message.answer("User not found.")
+        await state.clear()
         return
-    q = message.text
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    if q.isdigit():
-        c.execute("SELECT * FROM users WHERE user_id=?", (int(q),))
-    else:
-        c.execute("SELECT * FROM users WHERE username=?", (q.replace('@',''),))
-    u = c.fetchone()
-    conn.close()
-    if not u:
-        bot.send_message(uid, "❌ User not found")
-        return
-    txt = f"""👤 *User*
-ID: `{u['user_id']}`
-Name: {u['full_name']}
-Username: @{u['username']}
-Balance: {u['balance']}
-Banned: {u['banned']}"""
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("💰 Give", callback_data=f"give_{u['user_id']}"),
-        types.InlineKeyboardButton("🚫 Ban", callback_data=f"ban_{u['user_id']}")
+        
+    text = (
+        f"👤 *User Details*\n"
+        f"ID: `{user['user_id']}`\n"
+        f"Name: {user['full_name']}\n"
+        f"Username: @{user['username']}\n"
+        f"Balance: `{user['balance']:.2f}`\n"
+        f"Banned: *{'YES' if user['banned'] else 'NO'}*"
     )
-    bot.send_message(uid, txt, reply_markup=kb, parse_mode='Markdown')
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💰 Give Balance", callback_data=f"admin_give_bal_{user['user_id']}")
+    builder.button(text="🚫 Ban/Unban", callback_data=f"admin_ban_{user['user_id']}")
+    builder.button(text="🔙 Back to Users", callback_data="admin_users")
+    
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode=ParseMode.MARKDOWN)
+    await state.clear()
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("give_"))
-def give_balance_callback(call):
-    uid = call.from_user.id
-    if not is_admin(uid):
-        return
-    target = int(call.data.split("_")[1])
-    msg = bot.send_message(uid, "💰 Enter amount (+/-):")
-    bot.register_next_step_handler_by_chat_id(uid, update_user_balance, target)
-    bot.delete_message(call.message.chat.id, call.message.message_id)
+@router.callback_query(F.data.startswith("admin_give_bal_"))
+async def admin_give_balance_ask(callback: CallbackQuery, state: FSMContext):
+    user_id = int(callback.data.split("_")[3])
+    await state.update_data(target_user_id=user_id)
+    await callback.message.answer("💰 Enter amount to add (negative to subtract):")
+    await state.set_state(AdminStates.waiting_for_balance_change)
 
-def update_user_balance(message, target):
-    uid = message.chat.id
+@router.message(AdminStates.waiting_for_balance_change)
+async def admin_give_balance_process(message: types.Message, state: FSMContext):
     try:
-        amt = float(message.text)
-    except:
-        bot.send_message(uid, "❌ Invalid amount")
-        return
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amt, target))
-    conn.commit()
-    conn.close()
-    bot.send_message(uid, f"✅ Balance updated by {amt}")
+        amount = float(message.text)
+        data = await state.get_data()
+        user_id = data['target_user_id']
+        
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+            await db.commit()
+            
+        await message.answer(f"✅ Balance updated by {amount:.2f} for user {user_id}.", reply_markup=admin_panel_kb())
+        await state.clear()
+    except ValueError:
+        await message.answer("Invalid amount.")
 
-# ---------- অ্যাডমিন প্রোমো ----------
-def add_promo_code(message):
-    uid = message.chat.id
-    if not is_admin(uid):
-        return
-    code = message.text
-    bot.send_message(uid, "💰 Enter reward amount:")
-    bot.register_next_step_handler_by_chat_id(uid, add_promo_reward, code)
+@router.callback_query(F.data.startswith("admin_ban_"))
+async def admin_ban_user(callback: CallbackQuery):
+    user_id = int(callback.data.split("_")[2])
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Toggle ban
+        async with db.execute("SELECT banned FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            current_status = row[0] if row else 0
+            
+        new_status = 1 if current_status == 0 else 0
+        await db.execute("UPDATE users SET banned = ? WHERE user_id = ?", (new_status, user_id))
+        await db.commit()
+        
+    status_text = "Banned" if new_status else "Unbanned"
+    await callback.answer(f"User {status_text}!")
+    
+# --- Admin Settings ---
+@router.callback_query(F.data == "admin_settings")
+async def admin_settings_menu(callback: CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Change Welcome Message", callback_data="admin_set_welcome")
+    builder.button(text="Change Currency Symbol", callback_data="admin_set_currency")
+    builder.button(text="Change Support Link", callback_data="admin_set_support")
+    builder.button(text="Change Rules", callback_data="admin_set_rules")
+    builder.button(text="Toggle Captcha", callback_data="admin_toggle_captcha")
+    builder.button(text="Toggle Shop", callback_data="admin_toggle_shop")
+    builder.button(text="Set Referral Reward (Fixed)", callback_data="admin_set_ref_reward")
+    builder.button(text="Set Daily Reward", callback_data="admin_set_daily_reward")
+    builder.button(text="Toggle Daily Bonus", callback_data="admin_toggle_daily")
+    builder.button(text="Set Scratch Rewards", callback_data="admin_set_scratch_rewards")
+    builder.button(text="Toggle Scratch Card", callback_data="admin_toggle_scratch")
+    builder.button(text="🔙 Back", callback_data="admin_panel")
+    builder.adjust(2)
+    await callback.message.edit_text("⚙️ Bot Settings", reply_markup=builder.as_markup())
 
-def add_promo_reward(message, code):
-    uid = message.chat.id
+@router.callback_query(F.data.startswith("admin_set_"))
+async def admin_set_start(callback: CallbackQuery, state: FSMContext):
+    key_map = {
+        "admin_set_welcome": ("welcome_message", "New Welcome Message (use {name} for user name):"),
+        "admin_set_currency": ("currency", "New Currency Symbol:"),
+        "admin_set_support": ("support_link", "New Support Link (URL):"),
+        "admin_set_rules": ("rules", "New Rules Text:"),
+        "admin_set_ref_reward": ("referral_reward", "New Fixed Referral Reward Amount:"),
+        "admin_set_daily_reward": ("daily_reward", "New Daily Bonus Reward Amount:"),
+        "admin_set_scratch_rewards": ("scratch_rewards", "New Scratch Rewards (comma-separated, e.g., 1.0,5.0,10.0):"),
+    }
+    
+    if callback.data in key_map:
+        key, prompt = key_map[callback.data]
+        await state.update_data(setting_key=key)
+        await callback.message.answer(prompt)
+        await state.set_state(AdminStates.waiting_for_setting_value)
+    elif callback.data == "admin_toggle_captcha":
+        current = await get_setting("captcha_enabled")
+        new = "0" if current == "1" else "1"
+        await update_setting("captcha_enabled", new)
+        await callback.answer(f"Captcha Toggled. New status: {'ON' if new == '1' else 'OFF'}")
+        await admin_settings_menu(callback)
+    elif callback.data == "admin_toggle_shop":
+        current = await get_setting("shop_enabled")
+        new = "0" if current == "1" else "1"
+        await update_setting("shop_enabled", new)
+        await callback.answer(f"Shop Toggled. New status: {'ON' if new == '1' else 'OFF'}")
+        await admin_settings_menu(callback)
+    elif callback.data == "admin_toggle_daily":
+        current = await get_setting("daily_enabled")
+        new = "0" if current == "1" else "1"
+        await update_setting("daily_enabled", new)
+        await callback.answer(f"Daily Bonus Toggled. New status: {'ON' if new == '1' else 'OFF'}")
+        await admin_settings_menu(callback)
+    elif callback.data == "admin_toggle_scratch":
+        current = await get_setting("scratch_enabled")
+        new = "0" if current == "1" else "1"
+        await update_setting("scratch_enabled", new)
+        await callback.answer(f"Scratch Card Toggled. New status: {'ON' if new == '1' else 'OFF'}")
+        await admin_settings_menu(callback)
+
+@router.message(AdminStates.waiting_for_setting_value)
+async def admin_set_value(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    key = data['setting_key']
+    value = message.text
+    
+    await update_setting(key, value)
+    await message.answer(f"✅ Setting '{key}' updated to: `{value}`", reply_markup=admin_panel_kb(), parse_mode=ParseMode.MARKDOWN)
+    await state.clear()
+    
+# --- Admin Promos ---
+@router.callback_query(F.data == "admin_promos")
+async def admin_promos_menu(callback: CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Create Promo", callback_data="admin_create_promo")
+    builder.button(text="🔙 Back", callback_data="admin_panel")
+    await callback.message.edit_text("🎁 Promo Codes Management", reply_markup=builder.as_markup())
+
+@router.callback_query(F.data == "admin_create_promo")
+async def admin_create_promo(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("📝 Enter Promo Code:")
+    await state.set_state(AdminStates.waiting_for_promo_code)
+
+@router.message(AdminStates.waiting_for_promo_code)
+async def admin_promo_code(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT * FROM promos WHERE code = ?", (code,)) as cursor:
+            if await cursor.fetchone():
+                 await message.answer("Code already exists. Try another one:")
+                 return
+    await state.update_data(code=code)
+    await message.answer("💰 Reward Amount:")
+    await state.set_state(AdminStates.waiting_for_promo_reward)
+
+@router.message(AdminStates.waiting_for_promo_reward)
+async def admin_promo_reward(message: types.Message, state: FSMContext):
     try:
-        rew = float(message.text)
-    except:
-        bot.send_message(uid, "❌ Invalid number")
-        return
-    bot.send_message(uid, "🔢 Enter max uses (-1 for unlimited):")
-    bot.register_next_step_handler_by_chat_id(uid, add_promo_limit, code, rew)
+        reward = float(message.text)
+        await state.update_data(reward=reward)
+        await message.answer("🔢 Max Usage (-1 for unlimited):")
+        await state.set_state(AdminStates.waiting_for_promo_limit)
+    except ValueError:
+        await message.answer("Invalid number.")
 
-def add_promo_limit(message, code, rew):
-    uid = message.chat.id
+@router.message(AdminStates.waiting_for_promo_limit)
+async def admin_promo_limit(message: types.Message, state: FSMContext):
     try:
-        lim = int(message.text)
-    except:
-        bot.send_message(uid, "❌ Invalid number")
-        return
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT INTO promos (code, reward, max_use, expiry) VALUES (?,?,?,?)",
-              (code, rew, lim, "2099-12-31"))
-    conn.commit()
-    conn.close()
-    bot.send_message(uid, f"✅ Promo {code} created")
+        limit = int(message.text)
+        data = await state.get_data()
+        
+        async with aiosqlite.connect(DB_NAME) as db:
+            # Using expiry_date placeholder for simplicity as per previous structure
+            await db.execute("INSERT INTO promos (code, reward, max_usage, expiry_date) VALUES (?, ?, ?, ?)",
+                            (data['code'], data['reward'], limit, "2099-01-01")) 
+            await db.commit()
+            
+        await message.answer(f"✅ Promo '{data['code']}' Created!", reply_markup=admin_panel_kb())
+        await state.clear()
+    except ValueError:
+        await message.answer("Invalid number.")
 
-# ---------- অ্যাডমিন টাস্ক ----------
-def add_task_desc(message):
-    uid = message.chat.id
-    if not is_admin(uid):
-        return
-    desc = message.text
-    bot.send_message(uid, "🔗 Enter task link (or None):")
-    bot.register_next_step_handler_by_chat_id(uid, add_task_link, desc)
+# --- Admin Tasks ---
+@router.callback_query(F.data == "admin_tasks")
+async def admin_tasks_menu(callback: CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Create Task", callback_data="admin_create_task")
+    builder.button(text="🔙 Back", callback_data="admin_panel")
+    await callback.message.edit_text("📋 Task Management", reply_markup=builder.as_markup())
 
-def add_task_link(message, desc):
-    uid = message.chat.id
-    link = message.text
-    bot.send_message(uid, "💰 Enter reward:")
-    bot.register_next_step_handler_by_chat_id(uid, add_task_reward, desc, link)
+@router.callback_query(F.data == "admin_create_task")
+async def admin_create_task(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("📝 Task Description:")
+    await state.set_state(AdminStates.waiting_for_task_desc)
 
-def add_task_reward(message, desc, link):
-    uid = message.chat.id
+@router.message(AdminStates.waiting_for_task_desc)
+async def admin_task_desc(message: types.Message, state: FSMContext):
+    await state.update_data(desc=message.text)
+    await message.answer("🔗 Task Link (or 'None'):")
+    await state.set_state(AdminStates.waiting_for_task_link)
+
+@router.message(AdminStates.waiting_for_task_link)
+async def admin_task_link(message: types.Message, state: FSMContext):
+    await state.update_data(link=message.text)
+    await message.answer("💰 Reward Amount:")
+    await state.set_state(AdminStates.waiting_for_task_reward)
+
+@router.message(AdminStates.waiting_for_task_reward)
+async def admin_task_reward(message: types.Message, state: FSMContext):
     try:
-        rew = float(message.text)
-    except:
-        bot.send_message(uid, "❌ Invalid number")
+        reward = float(message.text)
+        data = await state.get_data()
+        
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("INSERT INTO tasks (description, link, reward) VALUES (?, ?, ?)",
+                            (data['desc'], data['link'], reward))
+            await db.commit()
+            
+        await message.answer("✅ Task Created!", reply_markup=admin_panel_kb())
+        await state.clear()
+    except ValueError:
+        await message.answer("Invalid number.")
+
+# --- Main Entry ---
+async def main():
+    if not TOKEN:
+        print("❌ Bot token not found. Please set TELEGRAM_BOT_TOKEN in your environment variables or .env file.")
+        print("Exiting...")
         return
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT INTO tasks (desc, link, reward) VALUES (?,?,?)", (desc, link, rew))
-    conn.commit()
-    conn.close()
-    bot.send_message(uid, "✅ Task created")
+    if not ADMIN_ID:
+        print("❌ Admin ID not found. Please set ADMIN_ID in your environment variables or .env file.")
+        print("Exiting...")
+        return
 
-# ---------- অ্যাডমিন সেটিংস ----------
-def update_setting(message, key):
-    uid = message.chat.id
-    val = message.text
-    set_setting(key, val)
-    bot.send_message(uid, f"✅ {key} updated")
-
-# ---------- অ্যাডমিন কীবোর্ড রিইউজ ----------
-def admin_panel_kb():
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("📊 Stats", callback_data="astat"),
-        types.InlineKeyboardButton("👥 Users", callback_data="auser")
-    )
-    kb.row(
-        types.InlineKeyboardButton("📢 Broadcast", callback_data="abcast"),
-        types.InlineKeyboardButton("🛍 Shop", callback_data="ashop")
-    )
-    kb.row(
-        types.InlineKeyboardButton("⚙️ Settings", callback_data="aset"),
-        types.InlineKeyboardButton("🎁 Promos", callback_data="apromo")
-    )
-    kb.row(
-        types.InlineKeyboardButton("📋 Tasks", callback_data="atask"),
-        types.InlineKeyboardButton("📦 Orders", callback_data="aorder")
-    )
-    kb.row(types.InlineKeyboardButton("📦 Backup DB", callback_data="abackup"))
-    return kb
-
-# ---------- মূল ফাংশন ----------
-def main():
-    init_db()
-    threading.Thread(target=run_flask, daemon=True).start()
-    print(f"🤖 Bot running on port {PORT}")
-    bot.infinity_polling()
+    # Initialize DB
+    await init_db()
+    
+    # Initialize Bot
+    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher() # Storage is handled by default or can be explicitly set
+    
+    dp.include_router(router)
+    
+    print("🤖 Bot is starting...")
+    # Skip updates to avoid processing old messages if needed, or just start polling
+    await bot.delete_webhook(drop_pending_updates=True) 
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        print(f"❌ An error occurred during polling: {e}")
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user.")
