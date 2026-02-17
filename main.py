@@ -55,20 +55,20 @@ def init_db():
         key TEXT PRIMARY KEY, value TEXT
     )""")
     defaults = {
-        "welcome_message": "Welcome to our Premium Shop, {name}!",
+        "welcome_message": "Welcome to our Shop『ＧＯＲＩＢＥＲ』 ＤＯＫＡＮ 🛒🏷️, {name}!",
         "currency": "★",
-        "support_link": "https://t.me/telegram",
-        "rules": "No spamming. Be respectful.",
+        "support_link": "https://t.me/rx_nahin_bot",
+        "rules": "Contact us to know the rules.@rx_nahin_bot",
         "channel_force_join": "",
         "captcha_enabled": "1",
         "shop_enabled": "1",
-        "referral_reward": "5.0",
+        "referral_reward": "45",
         "referral_type": "fixed",
-        "daily_reward": "2.0",
-        "daily_enabled": "1",
+        "daily_reward": "30",
+        "daily_enabled": "10",
         "scratch_enabled": "1",
-        "scratch_rewards": "1.0,5.0,10.0",
-        "backup_link": "coming soon"
+        "scratch_rewards": "15,5,20",
+        "backup_link": "unavailable"
     }
     for key, val in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
@@ -319,7 +319,7 @@ def cmd_start(message):
         return
 
     if get_setting("captcha_enabled") == "1":
-        emoji = random.choice(["🐱", "🐶", "🦊", "🐯", "🐼"])
+        emoji = random.choice(["☹️", "😅", "😭", "😂", "💀"])
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton(emoji, callback_data="captcha_ok"))
         bot.reply_to(message, f"🔒 Security: Click the {emoji} emoji below:", reply_markup=markup)
