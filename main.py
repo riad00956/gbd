@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import sys
 import random
 import zipfile
 import io
@@ -44,8 +43,8 @@ def home():
     return jsonify({
         "status": "running",
         "bot": "Telegram Shop Bot",
-        "version": "4.0",
-        "python": "3.11",
+        "version": "5.0",
+        "python": "3.10",
         "timestamp": datetime.now().isoformat()
     })
 
@@ -307,18 +306,13 @@ def generate_emoji_captcha():
 
 # ---------- Keyboards ----------
 def main_menu_kb(is_admin=False):
-    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.add(
-        KeyboardButton("🛍 Shop"),
-        KeyboardButton("👤 Profile"),
-        KeyboardButton("🎁 Daily Bonus"),
-        KeyboardButton("🎲 Scratch Card"),
-        KeyboardButton("📋 Tasks"),
-        KeyboardButton("ℹ️ Support"),
-        KeyboardButton("📜 Rules")
-    )
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("🛍 Shop", "👤 Profile")
+    kb.row("🎁 Daily Bonus", "🎲 Scratch Card")
+    kb.row("📋 Tasks", "ℹ️ Support")
+    kb.row("📜 Rules")
     if is_admin:
-        kb.add(KeyboardButton("⚙️ Admin Panel"))
+        kb.row("⚙️ Admin Panel")
     return kb
 
 def admin_panel_kb():
@@ -327,7 +321,7 @@ def admin_panel_kb():
         InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
         InlineKeyboardButton("👥 Users", callback_data="admin_users"),
         InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
-        InlineKeyboardButton("🛍 Shop", callback_data="admin_shop"),
+        InlineKeyboardButton("🛍 Shop Mgmt", callback_data="admin_shop"),
         InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"),
         InlineKeyboardButton("🎁 Promos", callback_data="admin_promos"),
         InlineKeyboardButton("📋 Tasks", callback_data="admin_tasks"),
@@ -338,12 +332,10 @@ def admin_panel_kb():
     return kb
 
 def shop_mgmt_kb():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("➕ Add Category", callback_data="admin_add_cat"),
-        InlineKeyboardButton("📋 List Categories", callback_data="admin_list_cats"),
-        InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
-    )
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("➕ Add Category", callback_data="admin_add_cat"))
+    kb.add(InlineKeyboardButton("📋 List Categories", callback_data="admin_list_cats"))
+    kb.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
     return kb
 
 # ---------- Bot Setup ----------
@@ -424,12 +416,10 @@ ID: `{user['user_id']}`
 🏅 Level: {level}
 📅 Joined: {user['joined_at']}"""
     
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("📦 Orders", callback_data="my_orders"),
-        InlineKeyboardButton("📜 History", callback_data="my_transactions"),
-        InlineKeyboardButton("🎁 Redeem", callback_data="redeem_promo")
-    )
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("📦 Orders", callback_data="my_orders"))
+    kb.add(InlineKeyboardButton("📜 History", callback_data="my_transactions"))
+    kb.add(InlineKeyboardButton("🎁 Redeem", callback_data="redeem_promo"))
     
     await message.reply(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
     
@@ -454,7 +444,6 @@ async def my_transactions(callback: CallbackQuery):
         text += f"\n• {t['created_at'][:10]} {t['type']}: {sign}{t['amount']} Credits"
     
     await callback.message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
-    await callback.answer()
 
 # ---------- Daily Bonus ----------
 @dp.message_handler(lambda msg: msg.text == "🎁 Daily Bonus")
@@ -517,7 +506,7 @@ async def tasks_list(message: Message):
         return await message.reply("✅ No tasks available")
     
     text = "📋 **Tasks:**\n"
-    kb = InlineKeyboardMarkup(row_width=1)
+    kb = InlineKeyboardMarkup()
     for t in tasks:
         text += f"\n🔹 {t['description']} – {t['reward']} Credits"
         kb.add(InlineKeyboardButton(f"✅ Complete", callback_data=f"do_task_{t['id']}"))
@@ -547,7 +536,6 @@ async def do_task(callback: CallbackQuery):
         await db.commit()
     
     await callback.message.edit_text(f"✅ **Task done!** +{task['reward']} Credits")
-    await callback.answer()
 
 # ---------- Promo ----------
 @dp.callback_query_handler(lambda c: c.data == "redeem_promo")
@@ -618,7 +606,7 @@ async def show_products(callback: CallbackQuery):
     if not prods:
         return await callback.message.edit_text("📭 No products")
     
-    kb = InlineKeyboardMarkup(row_width=1)
+    kb = InlineKeyboardMarkup()
     for p in prods:
         stock = "∞" if p['stock'] == -1 else p['stock']
         kb.add(InlineKeyboardButton(f"{p['name']} | {p['price']} | Stock:{stock}", callback_data=f"prod_{p['id']}"))
@@ -642,11 +630,9 @@ async def product_detail(callback: CallbackQuery):
 📦 Stock: `{'Unlimited' if prod['stock']==-1 else prod['stock']}`
 Type: `{prod['type']}`"""
     
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("💳 Buy", callback_data=f"buy_{prod['id']}"),
-        InlineKeyboardButton("🔙 Back", callback_data=f"back_to_cat_{prod['category_id']}")
-    )
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("💳 Buy", callback_data=f"buy_{prod['id']}"))
+    kb.add(InlineKeyboardButton("🔙 Back", callback_data=f"back_to_cat_{prod['category_id']}"))
     
     await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
@@ -743,7 +729,6 @@ async def my_orders(callback: CallbackQuery):
         text += f"\n🔹 {o['name']} – {o['status'].upper()}"
     
     await callback.message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
-    await callback.answer()
 
 # ---------- Admin Panel ----------
 @dp.message_handler(lambda msg: msg.text == "⚙️ Admin Panel")
@@ -768,13 +753,11 @@ async def admin_stats(callback: CallbackQuery):
 💰 Revenue: `{revenue}` {await get_setting('currency')}"""
     
     await callback.message.edit_text(text, reply_markup=admin_panel_kb(), parse_mode=ParseMode.MARKDOWN)
-    await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "admin_backup")
 async def admin_backup(callback: CallbackQuery):
     await callback.message.edit_text("📦 Creating backup...")
     await create_backup(bot, callback.from_user.id)
-    await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "admin_broadcast")
 async def broadcast_ask(callback: CallbackQuery, state: FSMContext):
@@ -832,7 +815,7 @@ async def list_cats(callback: CallbackQuery):
     if not cats:
         return await callback.message.edit_text("📭 No categories")
     
-    kb = InlineKeyboardMarkup(row_width=3)
+    kb = InlineKeyboardMarkup()
     for c in cats:
         kb.row(
             InlineKeyboardButton(f"📁 {c['name']}", callback_data=f"admin_cat_{c['id']}"),
@@ -879,7 +862,7 @@ async def cat_products(callback: CallbackQuery):
         cur = await db.execute("SELECT * FROM products WHERE category_id=?", (cat_id,))
         prods = await cur.fetchall()
     
-    kb = InlineKeyboardMarkup(row_width=3)
+    kb = InlineKeyboardMarkup()
     for p in prods:
         kb.row(
             InlineKeyboardButton(f"{p['name']} | {p['price']}", callback_data=f"admin_prod_{p['id']}"),
@@ -1030,11 +1013,9 @@ async def del_prod(callback: CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "admin_users")
 async def users_menu(callback: CallbackQuery):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("🔎 Search", callback_data="admin_search_user"),
-        InlineKeyboardButton("📋 List", callback_data="admin_list_users")
-    )
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🔎 Search", callback_data="admin_search_user"))
+    kb.add(InlineKeyboardButton("📋 List", callback_data="admin_list_users"))
     await callback.message.edit_text("👥 **Users**", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_search_user")
@@ -1064,11 +1045,9 @@ Username: @{user['username']}
 Balance: `{user['balance']}`
 Banned: `{bool(user['banned'])}`"""
     
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("💰 Give", callback_data=f"admin_give_bal_{user['user_id']}"),
-        InlineKeyboardButton("🚫 Ban", callback_data=f"admin_ban_{user['user_id']}")
-    )
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("💰 Give", callback_data=f"admin_give_bal_{user['user_id']}"))
+    kb.add(InlineKeyboardButton("🚫 Ban", callback_data=f"admin_ban_{user['user_id']}"))
     
     await message.reply(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
     await state.finish()
@@ -1120,7 +1099,6 @@ async def list_users(callback: CallbackQuery):
         text += f"\n`{u['user_id']}` | {u['full_name']} | `{u['balance']}`"
     
     await callback.message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
-    await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "admin_settings")
 async def settings_menu(callback: CallbackQuery):
@@ -1180,11 +1158,9 @@ async def save_setting(message: Message, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data == "admin_promos")
 async def promos_menu(callback: CallbackQuery):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("➕ Create", callback_data="admin_create_promo"),
-        InlineKeyboardButton("📋 List", callback_data="admin_list_promos")
-    )
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("➕ Create", callback_data="admin_create_promo"))
+    kb.add(InlineKeyboardButton("📋 List", callback_data="admin_list_promos"))
     await callback.message.edit_text("🎁 **Promos**", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_create_promo")
@@ -1238,8 +1214,6 @@ async def list_promos(callback: CallbackQuery):
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_del_promo_{p['code']}"))
         await callback.message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-    
-    await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data.startswith("admin_del_promo_"))
 async def del_promo(callback: CallbackQuery):
@@ -1252,11 +1226,9 @@ async def del_promo(callback: CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "admin_tasks")
 async def tasks_admin_menu(callback: CallbackQuery):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("➕ Create", callback_data="admin_create_task"),
-        InlineKeyboardButton("📋 List", callback_data="admin_list_tasks")
-    )
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("➕ Create", callback_data="admin_create_task"))
+    kb.add(InlineKeyboardButton("📋 List", callback_data="admin_list_tasks"))
     await callback.message.edit_text("📋 **Tasks**", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data == "admin_create_task")
@@ -1306,8 +1278,6 @@ async def list_tasks(callback: CallbackQuery):
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_del_task_{t['id']}"))
         await callback.message.answer(text, reply_markup=kb)
-    
-    await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data.startswith("admin_del_task_"))
 async def del_task(callback: CallbackQuery):
@@ -1333,8 +1303,6 @@ async def admin_orders(callback: CallbackQuery):
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("✅ Deliver", callback_data=f"admin_deliver_order_{o['id']}"))
         await callback.message.answer(text, reply_markup=kb)
-    
-    await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data.startswith("admin_deliver_order_"))
 async def deliver_order(callback: CallbackQuery):
@@ -1343,7 +1311,6 @@ async def deliver_order(callback: CallbackQuery):
         await db.execute("UPDATE orders SET status='delivered' WHERE id=?", (order_id,))
         await db.commit()
     await callback.message.edit_text(f"✅ Order #{order_id} delivered")
-    await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "admin_panel")
 async def back_to_admin(callback: CallbackQuery):
