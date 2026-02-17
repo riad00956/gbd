@@ -658,6 +658,13 @@ def shop_main(call):
 def admin_panel(message):
     bot.send_message(message.chat.id, "🔧 *Welcome to Admin Control*", reply_markup=admin_panel_kb())
 
+# Debug command to check current welcome message
+@bot.message_handler(commands=['get_welcome'])
+@admin_only
+def get_welcome(message):
+    welcome = get_setting("welcome_message")
+    bot.reply_to(message, f"📢 *Current Welcome Message:*\n{welcome}", parse_mode="Markdown")
+
 @bot.callback_query_handler(func=lambda call: call.data == "admin_stats")
 @admin_only_callback
 def admin_stats(call):
