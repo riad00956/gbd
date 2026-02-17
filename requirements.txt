@@ -1,5 +1,3 @@
-aiogram==3.10.0
-aiosqlite
-python-dotenv
+pyTelegramBotAPI
 flask
-gunicorn
+python-dotenv
