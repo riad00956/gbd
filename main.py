@@ -55,7 +55,7 @@ def init_db():
         key TEXT PRIMARY KEY, value TEXT
     )""")
     defaults = {
-        "welcome_message": "Welcome to our Shop『ＧＯＲＩＢＥＲ』 ＤＯＫＡＮ 🛒🏷️, {name}!",
+        "welcome_message": "Welcome to our Shop, {name}!",
         "currency": "★",
         "support_link": "https://t.me/rx_nahin_bot",
         "rules": "Contact us to know the rules.@rx_nahin_bot",
