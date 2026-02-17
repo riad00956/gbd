@@ -1507,4 +1507,6 @@ if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     logging.basicConfig(level=logging.INFO)
     print("🤖 Bot is polling...")
+    import time
+    time.sleep(5)  # ⏳ পুরনো ইনস্ট্যান্স বন্ধ হওয়ার জন্য অপেক্ষা
     bot.infinity_polling()
