@@ -65,7 +65,7 @@ def init_db():
         "referral_reward": "45",
         "referral_type": "fixed",
         "daily_reward": "30",
-        "daily_enabled": "10",
+        "daily_enabled": "1",                 # Fixed: was "10" before
         "scratch_enabled": "1",
         "scratch_rewards": "15,5,20",
         "backup_link": "unavailable"
@@ -362,11 +362,12 @@ def profile_handler(message):
     bot_info = bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
 
+    joined_at = escape_markdown(user['joined_at'])
     text = (f"👤 *Profile Details*\n\n"
             f"🆔 ID: `{user_id}`\n"
             f"💰 Points: `{user['balance']:.2f} {curr}`\n"
             f"💸 Total Spent: `{user['total_spent']:.2f} {curr}`\n"
-            f"📅 Joined: {escape_markdown(user['joined_at'])}\n\n"
+            f"📅 Joined: {joined_at}\n\n"
             f"🔗 *Referral Link:*\n`{ref_link}`")
 
     markup = InlineKeyboardMarkup()
@@ -689,7 +690,12 @@ def buy_product(call):
             delivery_data = p['content']
         elif p['type'] == 'file':
             status = "delivered"
-            delivery_data = p['content']
+            # Handle media types with prefix
+            if ':' in p['content']:
+                media_type, file_id = p['content'].split(':', 1)
+            else:
+                media_type, file_id = 'document', p['content']
+            delivery_data = f"{media_type}:{file_id}"   # store for order record
         else:
             status = "pending"
             delivery_data = "Manual fulfillment required"
@@ -703,10 +709,20 @@ def buy_product(call):
         if p['type'] == 'digital':
             bot.send_message(user_id, f"✅ Purchase Successful!\n\nYour item:\n`{escape_markdown(delivery_data)}`")
         elif p['type'] == 'file':
+            # Determine media type from stored data
+            if ':' in p['content']:
+                media_type, file_id = p['content'].split(':', 1)
+            else:
+                media_type, file_id = 'document', p['content']
             try:
-                bot.send_document(user_id, delivery_data, caption=f"✅ Your purchased file: {escape_markdown(p['name'])}")
+                if media_type == 'photo':
+                    bot.send_photo(user_id, file_id, caption=f"✅ Your purchased item: {escape_markdown(p['name'])}")
+                elif media_type == 'video':
+                    bot.send_video(user_id, file_id, caption=f"✅ Your purchased item: {escape_markdown(p['name'])}")
+                else:
+                    bot.send_document(user_id, file_id, caption=f"✅ Your purchased item: {escape_markdown(p['name'])}")
             except Exception as file_err:
-                bot.send_message(user_id, f"✅ Purchase Successful! File ID: {delivery_data}\n(Error sending file: {file_err})")
+                bot.send_message(user_id, f"✅ Purchase Successful! File ID: {file_id}\n(Error sending file: {file_err})")
         else:
             bot.send_message(user_id, "✅ Purchase Successful! Your order is pending admin approval. You'll receive it soon.")
         conn.close()
@@ -822,7 +838,7 @@ def search_user(message):
 @admin_only_callback
 def add_balance_start(call):
     try:
-        user_id = call.data.split("_")[1]
+        user_id = int(call.data.split("_")[1])   # Convert to int
         msg = bot.send_message(call.message.chat.id, f"Enter amount to add to user {user_id}:")
         bot.register_next_step_handler(msg, process_add_balance, user_id)
         bot.answer_callback_query(call.id)
@@ -972,6 +988,44 @@ def delete_category(call):
     except Exception as e:
         bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
+# --- Delete Product List ---
+@bot.callback_query_handler(func=lambda call: call.data == "del_prod_list")
+@admin_only_callback
+def del_prod_list(call):
+    try:
+        conn = get_db_connection()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT id, name FROM products")
+        prods = c.fetchall()
+        conn.close()
+        if not prods:
+            bot.answer_callback_query(call.id, "No products.")
+            return
+        markup = InlineKeyboardMarkup()
+        for prod in prods:
+            name = escape_markdown(prod['name'])
+            markup.add(InlineKeyboardButton(f"❌ {name}", callback_data=f"delprod_{prod['id']}"))
+        bot.edit_message_text("Select product to delete:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("delprod_"))
+@admin_only_callback
+def delete_product(call):
+    try:
+        prod_id = int(call.data.split("_")[1])
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("DELETE FROM products WHERE id = ?", (prod_id,))
+        conn.commit()
+        conn.close()
+        bot.answer_callback_query(call.id, "Product deleted.")
+        del_prod_list(call)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
+
 @bot.callback_query_handler(func=lambda call: call.data == "add_prod")
 @admin_only_callback
 def add_prod_start(call):
@@ -1072,7 +1126,7 @@ def add_prod_stock(message):
     if prod_type == "digital":
         msg = bot.reply_to(message, "Enter the digital content (text) to deliver:")
     elif prod_type == "file":
-        msg = bot.reply_to(message, "Upload the file (will be saved as file_id):", parse_mode=None)
+        msg = bot.reply_to(message, "Upload the file (document/photo/video):", parse_mode=None)
     else:
         msg = bot.reply_to(message, "Enter instructions for manual fulfillment:")
     bot.register_next_step_handler(msg, add_prod_content)
@@ -1083,10 +1137,16 @@ def add_prod_content(message):
         bot.reply_to(message, "Session expired.")
         return
     if temp_data[user_id]['type'] == "file":
-        if message.content_type == 'document':
-            content = message.document.file_id
+        if message.content_type in ['document', 'photo', 'video']:
+            if message.content_type == 'document':
+                content = f"document:{message.document.file_id}"
+            elif message.content_type == 'photo':
+                # Take the largest photo
+                content = f"photo:{message.photo[-1].file_id}"
+            elif message.content_type == 'video':
+                content = f"video:{message.video.file_id}"
         else:
-            bot.reply_to(message, "Please upload a file.")
+            bot.reply_to(message, "Please upload a file (document, photo, or video).")
             return
     else:
         content = message.text.strip()
