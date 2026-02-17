@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "my-telegram-bot"
+version = "0.1.0"
+description = "A Telegram shop bot"
+authors = ["Riad riadalhasan68@gmail.com"]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+aiogram = "3.3.0"
+aiosqlite = "0.19.0"
+python-dotenv = "1.0.0"
+flask = "2.3.3"
+
+# এই অংশটি pydantic-core-এর জন্য বাইনারি হুইল নিশ্চিত করে
+[[tool.poetry.source]]
+name = "pypi"
+priority = "default"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
