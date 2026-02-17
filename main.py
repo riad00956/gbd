@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import random
 import threading
 import logging
@@ -10,26 +11,10 @@ import telebot
 from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
-# ---------- Database setup ----------
-import psycopg2
-import psycopg2.extras
-import sqlite3  # fallback for local testing
-
-DB_URL = os.getenv("DATABASE_URL")  # Render PostgreSQL URL
-
-def get_db_connection():
-    if DB_URL:
-        # PostgreSQL
-        conn = psycopg2.connect(DB_URL, sslmode='require')
-        conn.autocommit = False
-        return conn
-    else:
-        # SQLite fallback (for local testing)
-        return sqlite3.connect("shop_bot.db")
-
 # ---------- Configuration ----------
 TOKEN = os.getenv("BT")
 ADMIN_ID = os.getenv("AD")
+DB_NAME = "shop_bot.db"
 PORT = int(os.environ.get("PORT", 1000))
 
 # ---------- Markdown Escape ----------
@@ -50,267 +35,157 @@ def run_flask():
 # ---------- Bot Initialization ----------
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 
+# Temporary data storage for multi-step operations
 temp_data = {}
 
-# ---------- Database Helpers (PostgreSQL compatible) ----------
+# ---------- Database Helpers (SQLite) ----------
+def get_db_connection():
+    return sqlite3.connect(DB_NAME)
+
 def init_db():
     conn = get_db_connection()
-    try:
-        with conn.cursor() as c:
-            if DB_URL:
-                # PostgreSQL
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS settings (
-                        key TEXT PRIMARY KEY,
-                        value TEXT
-                    )
-                """)
-                defaults = {
-                    "welcome_message": "Welcome to our Premium Shop, {name}!",
-                    "currency": "★",
-                    "support_link": "https://t.me/telegram",
-                    "rules": "No spamming. Be respectful.",
-                    "channel_force_join": "",
-                    "captcha_enabled": "1",
-                    "shop_enabled": "1",
-                    "referral_reward": "5.0",
-                    "referral_type": "fixed",
-                    "daily_reward": "2.0",
-                    "daily_enabled": "1",
-                    "scratch_enabled": "1",
-                    "scratch_rewards": "1.0,5.0,10.0",
-                    "backup_link": "coming soon"
-                }
-                for key, val in defaults.items():
-                    c.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING", (key, val))
+    c = conn.cursor()
+    # Settings table
+    c.execute("""CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY, value TEXT
+    )""")
+    defaults = {
+        "welcome_message": "Welcome to our Premium Shop, {name}!",
+        "currency": "★",
+        "support_link": "https://t.me/telegram",
+        "rules": "No spamming. Be respectful.",
+        "channel_force_join": "",
+        "captcha_enabled": "1",
+        "shop_enabled": "1",
+        "referral_reward": "5.0",
+        "referral_type": "fixed",
+        "daily_reward": "2.0",
+        "daily_enabled": "1",
+        "scratch_enabled": "1",
+        "scratch_rewards": "1.0,5.0,10.0",
+        "backup_link": "coming soon"
+    }
+    for key, val in defaults.items():
+        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
 
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        user_id BIGINT PRIMARY KEY,
-                        username TEXT,
-                        full_name TEXT,
-                        balance REAL DEFAULT 0.0,
-                        total_spent REAL DEFAULT 0.0,
-                        referrer_id BIGINT,
-                        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        banned INTEGER DEFAULT 0,
-                        last_daily_claim TIMESTAMP,
-                        last_scratch_claim TIMESTAMP
-                    )
-                """)
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS transactions (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT,
-                        amount REAL,
-                        type TEXT,
-                        description TEXT,
-                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS categories (
-                        id SERIAL PRIMARY KEY,
-                        name TEXT UNIQUE
-                    )
-                """)
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS products (
-                        id SERIAL PRIMARY KEY,
-                        category_id INTEGER,
-                        type TEXT,
-                        name TEXT,
-                        description TEXT,
-                        price REAL,
-                        content TEXT,
-                        stock INTEGER DEFAULT -1,
-                        FOREIGN KEY(category_id) REFERENCES categories(id)
-                    )
-                """)
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS orders (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT,
-                        product_id INTEGER,
-                        status TEXT,
-                        data TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS tasks (
-                        id SERIAL PRIMARY KEY,
-                        description TEXT,
-                        link TEXT,
-                        reward REAL
-                    )
-                """)
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS completed_tasks (
-                        user_id BIGINT,
-                        task_id INTEGER,
-                        PRIMARY KEY (user_id, task_id)
-                    )
-                """)
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS promos (
-                        code TEXT PRIMARY KEY,
-                        reward REAL,
-                        max_usage INTEGER,
-                        used_count INTEGER DEFAULT 0,
-                        expiry_date TEXT
-                    )
-                """)
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS promo_usage (
-                        user_id BIGINT,
-                        code TEXT,
-                        PRIMARY KEY (user_id, code)
-                    )
-                """)
-            else:
-                # SQLite
-                c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
-                defaults = {
-                    "welcome_message": "Welcome to our Premium Shop, {name}!",
-                    "currency": "★",
-                    "support_link": "https://t.me/telegram",
-                    "rules": "No spamming. Be respectful.",
-                    "channel_force_join": "",
-                    "captcha_enabled": "1",
-                    "shop_enabled": "1",
-                    "referral_reward": "5.0",
-                    "referral_type": "fixed",
-                    "daily_reward": "2.0",
-                    "daily_enabled": "1",
-                    "scratch_enabled": "1",
-                    "scratch_rewards": "1.0,5.0,10.0",
-                    "backup_link": "coming soon"
-                }
-                for key, val in defaults.items():
-                    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
+    # Users table
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        full_name TEXT,
+        balance REAL DEFAULT 0.0,
+        total_spent REAL DEFAULT 0.0,
+        referrer_id INTEGER,
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        banned INTEGER DEFAULT 0,
+        last_daily_claim TIMESTAMP,
+        last_scratch_claim TIMESTAMP
+    )""")
 
-                c.execute("""CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    full_name TEXT,
-                    balance REAL DEFAULT 0.0,
-                    total_spent REAL DEFAULT 0.0,
-                    referrer_id INTEGER,
-                    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    banned INTEGER DEFAULT 0,
-                    last_daily_claim TIMESTAMP,
-                    last_scratch_claim TIMESTAMP
-                )""")
-                c.execute("""CREATE TABLE IF NOT EXISTS transactions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    amount REAL,
-                    type TEXT,
-                    description TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )""")
-                c.execute("""CREATE TABLE IF NOT EXISTS categories (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE
-                )""")
-                c.execute("""CREATE TABLE IF NOT EXISTS products (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    category_id INTEGER,
-                    type TEXT,
-                    name TEXT,
-                    description TEXT,
-                    price REAL,
-                    content TEXT,
-                    stock INTEGER DEFAULT -1,
-                    FOREIGN KEY(category_id) REFERENCES categories(id)
-                )""")
-                c.execute("""CREATE TABLE IF NOT EXISTS orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    product_id INTEGER,
-                    status TEXT,
-                    data TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )""")
-                c.execute("""CREATE TABLE IF NOT EXISTS tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    description TEXT,
-                    link TEXT,
-                    reward REAL
-                )""")
-                c.execute("""CREATE TABLE IF NOT EXISTS completed_tasks (
-                    user_id INTEGER,
-                    task_id INTEGER,
-                    PRIMARY KEY (user_id, task_id)
-                )""")
-                c.execute("""CREATE TABLE IF NOT EXISTS promos (
-                    code TEXT PRIMARY KEY,
-                    reward REAL,
-                    max_usage INTEGER,
-                    used_count INTEGER DEFAULT 0,
-                    expiry_date TEXT
-                )""")
-                c.execute("""CREATE TABLE IF NOT EXISTS promo_usage (
-                    user_id INTEGER,
-                    code TEXT,
-                    PRIMARY KEY (user_id, code)
-                )""")
-            conn.commit()
-    finally:
-        conn.close()
+    # Transactions table
+    c.execute("""CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount REAL,
+        type TEXT,
+        description TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # Categories table
+    c.execute("""CREATE TABLE IF NOT EXISTS categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE
+    )""")
+
+    # Products table
+    c.execute("""CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category_id INTEGER,
+        type TEXT,
+        name TEXT,
+        description TEXT,
+        price REAL,
+        content TEXT,
+        stock INTEGER DEFAULT -1,
+        FOREIGN KEY(category_id) REFERENCES categories(id)
+    )""")
+
+    # Orders table
+    c.execute("""CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        product_id INTEGER,
+        status TEXT,
+        data TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # Tasks table
+    c.execute("""CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        description TEXT,
+        link TEXT,
+        reward REAL
+    )""")
+
+    # Completed tasks table
+    c.execute("""CREATE TABLE IF NOT EXISTS completed_tasks (
+        user_id INTEGER,
+        task_id INTEGER,
+        PRIMARY KEY (user_id, task_id)
+    )""")
+
+    # Promos table
+    c.execute("""CREATE TABLE IF NOT EXISTS promos (
+        code TEXT PRIMARY KEY,
+        reward REAL,
+        max_usage INTEGER,
+        used_count INTEGER DEFAULT 0,
+        expiry_date TEXT
+    )""")
+
+    # Promo usage table
+    c.execute("""CREATE TABLE IF NOT EXISTS promo_usage (
+        user_id INTEGER,
+        code TEXT,
+        PRIMARY KEY (user_id, code)
+    )""")
+
+    conn.commit()
+    conn.close()
 
 def get_setting(key):
     conn = get_db_connection()
-    try:
-        with conn.cursor() as c:
-            if DB_URL:
-                c.execute("SELECT value FROM settings WHERE key = %s", (key,))
-            else:
-                c.execute("SELECT value FROM settings WHERE key = ?", (key,))
-            row = c.fetchone()
-            return row[0] if row else ""
-    finally:
-        conn.close()
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else ""
 
 def update_setting(key, value):
     conn = get_db_connection()
-    try:
-        with conn.cursor() as c:
-            if DB_URL:
-                c.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, str(value)))
-            else:
-                c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-            conn.commit()
-    finally:
-        conn.close()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+    conn.commit()
+    conn.close()
 
 def get_user(user_id):
     conn = get_db_connection()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-            if DB_URL:
-                c.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
-            else:
-                c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-            row = c.fetchone()
-            return row
-    finally:
-        conn.close()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
 
 def add_transaction(user_id, amount, ttype, description):
     conn = get_db_connection()
-    try:
-        with conn.cursor() as c:
-            if DB_URL:
-                c.execute("INSERT INTO transactions (user_id, amount, type, description) VALUES (%s, %s, %s, %s)",
-                          (user_id, amount, ttype, description))
-            else:
-                c.execute("INSERT INTO transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)",
-                          (user_id, amount, ttype, description))
-            conn.commit()
-    finally:
-        conn.close()
+    c = conn.cursor()
+    c.execute("INSERT INTO transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)",
+              (user_id, amount, ttype, description))
+    conn.commit()
+    conn.close()
 
 def get_currency():
     return get_setting("currency") or "★"
@@ -403,37 +278,24 @@ def cmd_start(message):
             referrer_id = ref
 
     conn = get_db_connection()
-    try:
-        with conn.cursor() as c:
-            if DB_URL:
-                c.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
-            else:
-                c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-            user = c.fetchone()
-            if not user:
-                if DB_URL:
-                    c.execute("""INSERT INTO users (user_id, username, full_name, referrer_id)
-                                 VALUES (%s, %s, %s, %s)""",
-                              (user_id, message.from_user.username, message.from_user.full_name, referrer_id))
-                else:
-                    c.execute("""INSERT INTO users (user_id, username, full_name, referrer_id)
-                                 VALUES (?, ?, ?, ?)""",
-                              (user_id, message.from_user.username, message.from_user.full_name, referrer_id))
-                if referrer_id:
-                    reward = float(get_setting("referral_reward"))
-                    curr = get_currency()
-                    if DB_URL:
-                        c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (reward, referrer_id))
-                    else:
-                        c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (reward, referrer_id))
-                    add_transaction(referrer_id, reward, "credit", f"Referral bonus for {user_id}")
-                    try:
-                        bot.send_message(referrer_id, f"🎉 Someone joined via your link! You got {reward} {curr}")
-                    except:
-                        pass
-                conn.commit()
-    finally:
-        conn.close()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    user = c.fetchone()
+    if not user:
+        c.execute("""INSERT INTO users (user_id, username, full_name, referrer_id)
+                     VALUES (?, ?, ?, ?)""",
+                  (user_id, message.from_user.username, message.from_user.full_name, referrer_id))
+        if referrer_id:
+            reward = float(get_setting("referral_reward"))
+            curr = get_currency()
+            c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (reward, referrer_id))
+            add_transaction(referrer_id, reward, "credit", f"Referral bonus for {user_id}")
+            try:
+                bot.send_message(referrer_id, f"🎉 Someone joined via your link! You got {reward} {curr}")
+            except:
+                pass
+        conn.commit()
+    conn.close()
 
     if not check_force_join(user_id):
         channel = get_setting("channel_force_join")
@@ -504,15 +366,11 @@ def my_transactions(call):
     try:
         user_id = call.from_user.id
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM transactions WHERE user_id = %s ORDER BY timestamp DESC LIMIT 10", (user_id,))
-                else:
-                    c.execute("SELECT * FROM transactions WHERE user_id = ? ORDER BY timestamp DESC LIMIT 10", (user_id,))
-                rows = c.fetchall()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM transactions WHERE user_id = ? ORDER BY timestamp DESC LIMIT 10", (user_id,))
+        rows = c.fetchall()
+        conn.close()
         if not rows:
             bot.send_message(call.message.chat.id, "No transactions yet.")
             return
@@ -539,46 +397,37 @@ def process_redeem_promo(message):
     code = message.text.strip().upper()
     user_id = message.from_user.id
     conn = get_db_connection()
-    try:
-        with conn.cursor() as c:
-            if DB_URL:
-                c.execute("SELECT * FROM promos WHERE code = %s", (code,))
-            else:
-                c.execute("SELECT * FROM promos WHERE code = ?", (code,))
-            promo = c.fetchone()
-            if not promo:
-                bot.reply_to(message, "❌ Invalid promo code.")
-                return
-            if promo[4]:
-                exp_date = datetime.fromisoformat(promo[4])
-                if datetime.now() > exp_date:
-                    bot.reply_to(message, "❌ This promo has expired.")
-                    return
-            if promo[2] != -1 and promo[3] >= promo[2]:
-                bot.reply_to(message, "❌ This promo has reached its usage limit.")
-                return
-            if DB_URL:
-                c.execute("SELECT * FROM promo_usage WHERE user_id = %s AND code = %s", (user_id, code))
-            else:
-                c.execute("SELECT * FROM promo_usage WHERE user_id = ? AND code = ?", (user_id, code))
-            if c.fetchone():
-                bot.reply_to(message, "❌ You have already used this promo.")
-                return
-
-            reward = promo[1]
-            if DB_URL:
-                c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (reward, user_id))
-                c.execute("UPDATE promos SET used_count = used_count + 1 WHERE code = %s", (code,))
-                c.execute("INSERT INTO promo_usage (user_id, code) VALUES (%s, %s)", (user_id, code))
-            else:
-                c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (reward, user_id))
-                c.execute("UPDATE promos SET used_count = used_count + 1 WHERE code = ?", (code,))
-                c.execute("INSERT INTO promo_usage (user_id, code) VALUES (?, ?)", (user_id, code))
-            conn.commit()
-            add_transaction(user_id, reward, "credit", f"Promo code: {code}")
-            bot.reply_to(message, f"✅ Promo applied! You received {reward} {get_currency()}.")
-    finally:
+    c = conn.cursor()
+    c.execute("SELECT * FROM promos WHERE code = ?", (code,))
+    promo = c.fetchone()
+    if not promo:
+        bot.reply_to(message, "❌ Invalid promo code.")
         conn.close()
+        return
+    if promo[4]:
+        exp_date = datetime.fromisoformat(promo[4])
+        if datetime.now() > exp_date:
+            bot.reply_to(message, "❌ This promo has expired.")
+            conn.close()
+            return
+    if promo[2] != -1 and promo[3] >= promo[2]:
+        bot.reply_to(message, "❌ This promo has reached its usage limit.")
+        conn.close()
+        return
+    c.execute("SELECT * FROM promo_usage WHERE user_id = ? AND code = ?", (user_id, code))
+    if c.fetchone():
+        bot.reply_to(message, "❌ You have already used this promo.")
+        conn.close()
+        return
+
+    reward = promo[1]
+    c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (reward, user_id))
+    c.execute("UPDATE promos SET used_count = used_count + 1 WHERE code = ?", (code,))
+    c.execute("INSERT INTO promo_usage (user_id, code) VALUES (?, ?)", (user_id, code))
+    conn.commit()
+    add_transaction(user_id, reward, "credit", f"Promo code: {code}")
+    bot.reply_to(message, f"✅ Promo applied! You received {reward} {get_currency()}.")
+    conn.close()
 
 # ---------- Daily Bonus ----------
 @bot.message_handler(func=lambda m: m.text == "🎁 Daily Bonus")
@@ -601,17 +450,11 @@ def daily_bonus(message):
                 return
         reward = float(get_setting("daily_reward"))
         conn = get_db_connection()
-        try:
-            with conn.cursor() as c:
-                if DB_URL:
-                    c.execute("UPDATE users SET balance = balance + %s, last_daily_claim = %s WHERE user_id = %s",
-                              (reward, now.isoformat(), user_id))
-                else:
-                    c.execute("UPDATE users SET balance = balance + ?, last_daily_claim = ? WHERE user_id = ?",
-                              (reward, now.isoformat(), user_id))
-                conn.commit()
-        finally:
-            conn.close()
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = balance + ?, last_daily_claim = ? WHERE user_id = ?",
+                  (reward, now.isoformat(), user_id))
+        conn.commit()
+        conn.close()
         add_transaction(user_id, reward, "credit", "Daily Bonus")
         bot.reply_to(message, f"🎉 You received {reward} {get_currency()} as daily bonus!")
     except Exception as e:
@@ -639,17 +482,11 @@ def scratch_card(message):
         rewards = [float(x) for x in get_setting("scratch_rewards").split(",")]
         win = random.choice(rewards)
         conn = get_db_connection()
-        try:
-            with conn.cursor() as c:
-                if DB_URL:
-                    c.execute("UPDATE users SET balance = balance + %s, last_scratch_claim = %s WHERE user_id = %s",
-                              (win, now.isoformat(), user_id))
-                else:
-                    c.execute("UPDATE users SET balance = balance + ?, last_scratch_claim = ? WHERE user_id = ?",
-                              (win, now.isoformat(), user_id))
-                conn.commit()
-        finally:
-            conn.close()
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = balance + ?, last_scratch_claim = ? WHERE user_id = ?",
+                  (win, now.isoformat(), user_id))
+        conn.commit()
+        conn.close()
         add_transaction(user_id, win, "credit", "Scratch Card Win")
         bot.reply_to(message, f"✨ You scratched the card and won `{win:.2f}` {get_currency()}!")
     except Exception as e:
@@ -662,23 +499,17 @@ def list_tasks(message):
     try:
         user_id = message.from_user.id
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM tasks")
-                else:
-                    c.execute("SELECT * FROM tasks")
-                tasks = c.fetchall()
-                if not tasks:
-                    bot.reply_to(message, "No tasks available at the moment.")
-                    return
-                if DB_URL:
-                    c.execute("SELECT task_id FROM completed_tasks WHERE user_id = %s", (user_id,))
-                else:
-                    c.execute("SELECT task_id FROM completed_tasks WHERE user_id = ?", (user_id,))
-                completed = {row[0] for row in c.fetchall()}
-        finally:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks")
+        tasks = c.fetchall()
+        if not tasks:
+            bot.reply_to(message, "No tasks available at the moment.")
             conn.close()
+            return
+        c.execute("SELECT task_id FROM completed_tasks WHERE user_id = ?", (user_id,))
+        completed = {row[0] for row in c.fetchall()}
+        conn.close()
 
         markup = InlineKeyboardMarkup()
         for task in tasks:
@@ -698,35 +529,26 @@ def task_callback(call):
         task_id = int(call.data.split("_")[1])
         user_id = call.from_user.id
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM tasks WHERE id = %s", (task_id,))
-                else:
-                    c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
-                task = c.fetchone()
-                if not task:
-                    bot.answer_callback_query(call.id, "Task not found.")
-                    return
-                if DB_URL:
-                    c.execute("SELECT * FROM completed_tasks WHERE user_id = %s AND task_id = %s", (user_id, task_id))
-                else:
-                    c.execute("SELECT * FROM completed_tasks WHERE user_id = ? AND task_id = ?", (user_id, task_id))
-                if c.fetchone():
-                    bot.answer_callback_query(call.id, "You already completed this task.")
-                    return
-                if DB_URL:
-                    c.execute("INSERT INTO completed_tasks (user_id, task_id) VALUES (%s, %s)", (user_id, task_id))
-                    c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (task['reward'], user_id))
-                else:
-                    c.execute("INSERT INTO completed_tasks (user_id, task_id) VALUES (?, ?)", (user_id, task_id))
-                    c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (task['reward'], user_id))
-                conn.commit()
-        finally:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        task = c.fetchone()
+        if not task:
+            bot.answer_callback_query(call.id, "Task not found.")
             conn.close()
+            return
+        c.execute("SELECT * FROM completed_tasks WHERE user_id = ? AND task_id = ?", (user_id, task_id))
+        if c.fetchone():
+            bot.answer_callback_query(call.id, "You already completed this task.")
+            conn.close()
+            return
+        c.execute("INSERT INTO completed_tasks (user_id, task_id) VALUES (?, ?)", (user_id, task_id))
+        c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (task['reward'], user_id))
+        conn.commit()
         add_transaction(user_id, task['reward'], "credit", f"Task: {task['description']}")
         bot.answer_callback_query(call.id, f"✅ Task completed! You earned {task['reward']} {get_currency()}.")
         bot.send_message(call.message.chat.id, f"🎉 You completed: {escape_markdown(task['description'])}\n💰 Reward: {task['reward']} {get_currency()}")
+        conn.close()
     except Exception as e:
         bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
@@ -750,15 +572,11 @@ def shop_entry(message):
             bot.reply_to(message, "⚠️ Shop is currently disabled.")
             return
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM categories")
-                else:
-                    c.execute("SELECT * FROM categories")
-                cats = c.fetchall()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM categories")
+        cats = c.fetchall()
+        conn.close()
         if not cats:
             bot.reply_to(message, "No categories available.")
             return
@@ -774,15 +592,11 @@ def show_products(call):
     try:
         cat_id = int(call.data.split("_")[1])
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM products WHERE category_id = %s", (cat_id,))
-                else:
-                    c.execute("SELECT * FROM products WHERE category_id = ?", (cat_id,))
-                prods = c.fetchall()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM products WHERE category_id = ?", (cat_id,))
+        prods = c.fetchall()
+        conn.close()
         if not prods:
             bot.answer_callback_query(call.id, "No products in this category.")
             return
@@ -804,15 +618,11 @@ def product_detail(call):
     try:
         prod_id = int(call.data.split("_")[1])
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM products WHERE id = %s", (prod_id,))
-                else:
-                    c.execute("SELECT * FROM products WHERE id = ?", (prod_id,))
-                p = c.fetchone()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM products WHERE id = ?", (prod_id,))
+        p = c.fetchone()
+        conn.close()
         if not p:
             bot.answer_callback_query(call.id, "Product not found.")
             return
@@ -837,59 +647,43 @@ def buy_product(call):
         prod_id = int(call.data.split("_")[1])
         user_id = call.from_user.id
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM products WHERE id = %s", (prod_id,))
-                else:
-                    c.execute("SELECT * FROM products WHERE id = ?", (prod_id,))
-                p = c.fetchone()
-                if DB_URL:
-                    c.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
-                else:
-                    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-                u = c.fetchone()
-                if not p or not u:
-                    bot.answer_callback_query(call.id, "Error: product or user not found.")
-                    return
-                if u['balance'] < p['price']:
-                    bot.answer_callback_query(call.id, "❌ Insufficient points!", show_alert=True)
-                    return
-                if p['stock'] != -1 and p['stock'] <= 0:
-                    bot.answer_callback_query(call.id, "❌ Out of stock!", show_alert=True)
-                    return
-
-                if DB_URL:
-                    c.execute("UPDATE users SET balance = balance - %s, total_spent = total_spent + %s WHERE user_id = %s",
-                              (p['price'], p['price'], user_id))
-                else:
-                    c.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id = ?",
-                              (p['price'], p['price'], user_id))
-                if p['stock'] != -1:
-                    if DB_URL:
-                        c.execute("UPDATE products SET stock = stock - 1 WHERE id = %s", (prod_id,))
-                    else:
-                        c.execute("UPDATE products SET stock = stock - 1 WHERE id = ?", (prod_id,))
-
-                if p['type'] == 'digital':
-                    status = "delivered"
-                    delivery_data = p['content']
-                elif p['type'] == 'file':
-                    status = "delivered"
-                    delivery_data = p['content']
-                else:
-                    status = "pending"
-                    delivery_data = "Manual fulfillment required"
-
-                if DB_URL:
-                    c.execute("INSERT INTO orders (user_id, product_id, status, data) VALUES (%s, %s, %s, %s)",
-                              (user_id, prod_id, status, delivery_data))
-                else:
-                    c.execute("INSERT INTO orders (user_id, product_id, status, data) VALUES (?, ?, ?, ?)",
-                              (user_id, prod_id, status, delivery_data))
-                conn.commit()
-        finally:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM products WHERE id = ?", (prod_id,))
+        p = c.fetchone()
+        c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        u = c.fetchone()
+        if not p or not u:
+            bot.answer_callback_query(call.id, "Error: product or user not found.")
             conn.close()
+            return
+        if u['balance'] < p['price']:
+            bot.answer_callback_query(call.id, "❌ Insufficient points!", show_alert=True)
+            conn.close()
+            return
+        if p['stock'] != -1 and p['stock'] <= 0:
+            bot.answer_callback_query(call.id, "❌ Out of stock!", show_alert=True)
+            conn.close()
+            return
+
+        c.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id = ?",
+                  (p['price'], p['price'], user_id))
+        if p['stock'] != -1:
+            c.execute("UPDATE products SET stock = stock - 1 WHERE id = ?", (prod_id,))
+
+        if p['type'] == 'digital':
+            status = "delivered"
+            delivery_data = p['content']
+        elif p['type'] == 'file':
+            status = "delivered"
+            delivery_data = p['content']
+        else:
+            status = "pending"
+            delivery_data = "Manual fulfillment required"
+
+        c.execute("INSERT INTO orders (user_id, product_id, status, data) VALUES (?, ?, ?, ?)",
+                  (user_id, prod_id, status, delivery_data))
+        conn.commit()
         add_transaction(user_id, -p['price'], "debit", f"Purchased {p['name']}")
 
         # Send delivery
@@ -902,6 +696,7 @@ def buy_product(call):
                 bot.send_message(user_id, f"✅ Purchase Successful! File ID: {delivery_data}\n(Error sending file: {file_err})")
         else:
             bot.send_message(user_id, "✅ Purchase Successful! Your order is pending admin approval. You'll receive it soon.")
+        conn.close()
         bot.answer_callback_query(call.id)
     except Exception as e:
         bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
@@ -943,24 +738,14 @@ def get_welcome(message):
 def admin_stats(call):
     try:
         conn = get_db_connection()
-        try:
-            with conn.cursor() as c:
-                if DB_URL:
-                    c.execute("SELECT COUNT(*) FROM users")
-                    user_count = c.fetchone()[0]
-                    c.execute("SELECT COUNT(*) FROM orders")
-                    order_count = c.fetchone()[0]
-                    c.execute("SELECT SUM(total_spent) FROM users")
-                    revenue = c.fetchone()[0] or 0
-                else:
-                    c.execute("SELECT COUNT(*) FROM users")
-                    user_count = c.fetchone()[0]
-                    c.execute("SELECT COUNT(*) FROM orders")
-                    order_count = c.fetchone()[0]
-                    c.execute("SELECT SUM(total_spent) FROM users")
-                    revenue = c.fetchone()[0] or 0
-        finally:
-            conn.close()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        user_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM orders")
+        order_count = c.fetchone()[0]
+        c.execute("SELECT SUM(total_spent) FROM users")
+        revenue = c.fetchone()[0] or 0
+        conn.close()
         text = (f"📊 *Bot Statistics*\n\n"
                 f"👥 Total Users: `{user_count}`\n"
                 f"📦 Total Orders: `{order_count}`\n"
@@ -975,15 +760,11 @@ def admin_stats(call):
 def admin_users(call):
     try:
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT user_id, username, balance, banned FROM users LIMIT 10")
-                else:
-                    c.execute("SELECT user_id, username, balance, banned FROM users LIMIT 10")
-                users = c.fetchall()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT user_id, username, balance, banned FROM users LIMIT 10")
+        users = c.fetchall()
+        conn.close()
         text = "👥 *Recent Users*\n\n"
         for u in users:
             status = "🔴 Banned" if u['banned'] else "🟢 Active"
@@ -1042,17 +823,12 @@ def process_add_balance(message, target_id):
         bot.reply_to(message, "Invalid amount.")
         return
     conn = get_db_connection()
-    try:
-        with conn.cursor() as c:
-            if DB_URL:
-                c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (amount, target_id))
-            else:
-                c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, target_id))
-            conn.commit()
-    finally:
-        conn.close()
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, target_id))
+    conn.commit()
     add_transaction(target_id, amount, "credit", "Admin add")
     bot.reply_to(message, f"✅ Added {amount} {get_currency()} to user {target_id}.")
+    conn.close()
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("ban_"))
 @admin_only_callback
@@ -1060,23 +836,15 @@ def toggle_ban(call):
     try:
         user_id = int(call.data.split("_")[1])
         conn = get_db_connection()
-        try:
-            with conn.cursor() as c:
-                if DB_URL:
-                    c.execute("SELECT banned FROM users WHERE user_id = %s", (user_id,))
-                else:
-                    c.execute("SELECT banned FROM users WHERE user_id = ?", (user_id,))
-                row = c.fetchone()
-                if row:
-                    new_status = 0 if row[0] else 1
-                    if DB_URL:
-                        c.execute("UPDATE users SET banned = %s WHERE user_id = %s", (new_status, user_id))
-                    else:
-                        c.execute("UPDATE users SET banned = ? WHERE user_id = ?", (new_status, user_id))
-                    conn.commit()
-                    bot.answer_callback_query(call.id, f"User {'banned' if new_status else 'unbanned'}.")
-        finally:
-            conn.close()
+        c = conn.cursor()
+        c.execute("SELECT banned FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        if row:
+            new_status = 0 if row[0] else 1
+            c.execute("UPDATE users SET banned = ? WHERE user_id = ?", (new_status, user_id))
+            conn.commit()
+            bot.answer_callback_query(call.id, f"User {'banned' if new_status else 'unbanned'}.")
+        conn.close()
     except Exception as e:
         bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
@@ -1093,15 +861,10 @@ def broadcast_start(call):
 
 def process_broadcast(message):
     conn = get_db_connection()
-    try:
-        with conn.cursor() as c:
-            if DB_URL:
-                c.execute("SELECT user_id FROM users")
-            else:
-                c.execute("SELECT user_id FROM users")
-            users = [row[0] for row in c.fetchall()]
-    finally:
-        conn.close()
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users")
+    users = [row[0] for row in c.fetchall()]
+    conn.close()
     sent = 0
     for uid in users:
         try:
@@ -1150,33 +913,25 @@ def add_cat_start(call):
 def add_cat_finish(message):
     name = message.text.strip()
     conn = get_db_connection()
+    c = conn.cursor()
     try:
-        with conn.cursor() as c:
-            if DB_URL:
-                c.execute("INSERT INTO categories (name) VALUES (%s)", (name,))
-            else:
-                c.execute("INSERT INTO categories (name) VALUES (?)", (name,))
-            conn.commit()
+        c.execute("INSERT INTO categories (name) VALUES (?)", (name,))
+        conn.commit()
         bot.reply_to(message, f"✅ Category '{escape_markdown(name)}' added.")
-    except Exception as e:
+    except sqlite3.IntegrityError:
         bot.reply_to(message, "❌ Category already exists.")
-    finally:
-        conn.close()
+    conn.close()
 
 @bot.callback_query_handler(func=lambda call: call.data == "del_cat_list")
 @admin_only_callback
 def del_cat_list(call):
     try:
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM categories")
-                else:
-                    c.execute("SELECT * FROM categories")
-                cats = c.fetchall()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM categories")
+        cats = c.fetchall()
+        conn.close()
         if not cats:
             bot.answer_callback_query(call.id, "No categories.")
             return
@@ -1195,15 +950,10 @@ def delete_category(call):
     try:
         cat_id = int(call.data.split("_")[1])
         conn = get_db_connection()
-        try:
-            with conn.cursor() as c:
-                if DB_URL:
-                    c.execute("DELETE FROM categories WHERE id = %s", (cat_id,))
-                else:
-                    c.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
-                conn.commit()
-        finally:
-            conn.close()
+        c = conn.cursor()
+        c.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
+        conn.commit()
+        conn.close()
         bot.answer_callback_query(call.id, "Category deleted.")
         del_cat_list(call)
     except Exception as e:
@@ -1214,15 +964,11 @@ def delete_category(call):
 def add_prod_start(call):
     try:
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM categories")
-                else:
-                    c.execute("SELECT * FROM categories")
-                cats = c.fetchall()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM categories")
+        cats = c.fetchall()
+        conn.close()
         if not cats:
             bot.answer_callback_query(call.id, "No categories. Add one first.")
             return
@@ -1334,19 +1080,12 @@ def add_prod_content(message):
 
     data = temp_data[user_id]
     conn = get_db_connection()
-    try:
-        with conn.cursor() as c:
-            if DB_URL:
-                c.execute("""INSERT INTO products (category_id, type, name, description, price, content, stock)
-                             VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                          (data['cat_id'], data['type'], data['name'], data['desc'], data['price'], content, data['stock']))
-            else:
-                c.execute("""INSERT INTO products (category_id, type, name, description, price, content, stock)
-                             VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                          (data['cat_id'], data['type'], data['name'], data['desc'], data['price'], content, data['stock']))
-            conn.commit()
-    finally:
-        conn.close()
+    c = conn.cursor()
+    c.execute("""INSERT INTO products (category_id, type, name, description, price, content, stock)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
+              (data['cat_id'], data['type'], data['name'], data['desc'], data['price'], content, data['stock']))
+    conn.commit()
+    conn.close()
     del temp_data[user_id]
     bot.reply_to(message, "✅ Product added successfully!")
 
@@ -1356,15 +1095,11 @@ def add_prod_content(message):
 def admin_orders(call):
     try:
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY created_at DESC LIMIT 10")
-                else:
-                    c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY created_at DESC LIMIT 10")
-                orders = c.fetchall()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY created_at DESC LIMIT 10")
+        orders = c.fetchall()
+        conn.close()
         if not orders:
             bot.edit_message_text("No pending orders.", call.message.chat.id, call.message.message_id, reply_markup=admin_panel_kb())
             bot.answer_callback_query(call.id)
@@ -1385,15 +1120,11 @@ def order_detail(call):
     try:
         order_id = int(call.data.split("_")[1])
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
-                else:
-                    c.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
-                o = c.fetchone()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
+        o = c.fetchone()
+        conn.close()
         if not o:
             bot.answer_callback_query(call.id, "Order not found.")
             return
@@ -1417,15 +1148,10 @@ def mark_delivered(call):
     try:
         order_id = int(call.data.split("_")[1])
         conn = get_db_connection()
-        try:
-            with conn.cursor() as c:
-                if DB_URL:
-                    c.execute("UPDATE orders SET status='delivered' WHERE id=%s", (order_id,))
-                else:
-                    c.execute("UPDATE orders SET status='delivered' WHERE id=?", (order_id,))
-                conn.commit()
-        finally:
-            conn.close()
+        c = conn.cursor()
+        c.execute("UPDATE orders SET status='delivered' WHERE id=?", (order_id,))
+        conn.commit()
+        conn.close()
         bot.answer_callback_query(call.id, "Order marked delivered.")
         order_detail(call)
     except Exception as e:
@@ -1599,20 +1325,15 @@ def create_promo_expiry(message):
     reward = temp_data[user_id]['reward']
     max_usage = temp_data[user_id]['max_usage']
     conn = get_db_connection()
+    c = conn.cursor()
     try:
-        with conn.cursor() as c:
-            if DB_URL:
-                c.execute("INSERT INTO promos (code, reward, max_usage, expiry_date) VALUES (%s, %s, %s, %s)",
-                          (code, reward, max_usage, expiry if expiry else None))
-            else:
-                c.execute("INSERT INTO promos (code, reward, max_usage, expiry_date) VALUES (?, ?, ?, ?)",
-                          (code, reward, max_usage, expiry if expiry else None))
-            conn.commit()
+        c.execute("INSERT INTO promos (code, reward, max_usage, expiry_date) VALUES (?, ?, ?, ?)",
+                  (code, reward, max_usage, expiry if expiry else None))
+        conn.commit()
         bot.reply_to(message, f"✅ Promo {code} created.")
-    except Exception as e:
+    except sqlite3.IntegrityError:
         bot.reply_to(message, "❌ Promo code already exists.")
-    finally:
-        conn.close()
+    conn.close()
     del temp_data[user_id]
 
 @bot.callback_query_handler(func=lambda call: call.data == "list_promos")
@@ -1620,15 +1341,11 @@ def create_promo_expiry(message):
 def list_promos(call):
     try:
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM promos")
-                else:
-                    c.execute("SELECT * FROM promos")
-                promos = c.fetchall()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM promos")
+        promos = c.fetchall()
+        conn.close()
         if not promos:
             bot.answer_callback_query(call.id, "No promos.")
             return
@@ -1697,15 +1414,10 @@ def add_task_reward(message):
     desc = temp_data[user_id]['task_desc']
     link = temp_data[user_id]['link']
     conn = get_db_connection()
-    try:
-        with conn.cursor() as c:
-            if DB_URL:
-                c.execute("INSERT INTO tasks (description, link, reward) VALUES (%s, %s, %s)", (desc, link, reward))
-            else:
-                c.execute("INSERT INTO tasks (description, link, reward) VALUES (?, ?, ?)", (desc, link, reward))
-            conn.commit()
-    finally:
-        conn.close()
+    c = conn.cursor()
+    c.execute("INSERT INTO tasks (description, link, reward) VALUES (?, ?, ?)", (desc, link, reward))
+    conn.commit()
+    conn.close()
     del temp_data[user_id]
     bot.reply_to(message, "✅ Task added.")
 
@@ -1714,15 +1426,11 @@ def add_task_reward(message):
 def list_tasks_admin(call):
     try:
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT * FROM tasks")
-                else:
-                    c.execute("SELECT * FROM tasks")
-                tasks = c.fetchall()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks")
+        tasks = c.fetchall()
+        conn.close()
         if not tasks:
             bot.answer_callback_query(call.id, "No tasks.")
             return
@@ -1743,15 +1451,10 @@ def delete_task(call):
     try:
         task_id = int(call.data.split("_")[1])
         conn = get_db_connection()
-        try:
-            with conn.cursor() as c:
-                if DB_URL:
-                    c.execute("DELETE FROM tasks WHERE id = %s", (task_id,))
-                else:
-                    c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-                conn.commit()
-        finally:
-            conn.close()
+        c = conn.cursor()
+        c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.commit()
+        conn.close()
         bot.answer_callback_query(call.id, "Task deleted.")
         list_tasks_admin(call)
     except Exception as e:
@@ -1763,15 +1466,11 @@ def delete_task(call):
 def admin_leaderboard(call):
     try:
         conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictRow if DB_URL else sqlite3.Row) as c:
-                if DB_URL:
-                    c.execute("SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT 10")
-                else:
-                    c.execute("SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT 10")
-                top = c.fetchall()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT 10")
+        top = c.fetchall()
+        conn.close()
         if not top:
             bot.send_message(call.message.chat.id, "No users yet.")
             bot.answer_callback_query(call.id)
@@ -1789,8 +1488,12 @@ def admin_leaderboard(call):
 @bot.callback_query_handler(func=lambda call: call.data == "admin_backup")
 @admin_only_callback
 def admin_backup(call):
-    # PostgreSQL backup is more complex; we'll just note it's not available.
-    bot.answer_callback_query(call.id, "Backup via file not supported with PostgreSQL. Use pg_dump manually.", show_alert=True)
+    try:
+        with open(DB_NAME, 'rb') as f:
+            bot.send_document(call.message.chat.id, f, caption=f"📅 Database backup {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 # --- Fallback to main menu for any text ---
 @bot.message_handler(func=lambda m: True)
