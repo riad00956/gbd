@@ -1,14 +1,12 @@
-import logging
 import os
-import random
-import sqlite3
 import json
+import sqlite3
+import random
 import threading
 from datetime import datetime, date
 from functools import wraps
 
 from flask import Flask, jsonify
-from dotenv import load_dotenv
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton, ParseMode
@@ -17,9 +15,6 @@ from telegram.ext import (
     Updater, CommandHandler, MessageHandler, Filters,
     CallbackContext, CallbackQueryHandler, ConversationHandler
 )
-
-# Load environment
-load_dotenv()
 
 # ---------- Configuration ----------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -35,7 +30,7 @@ def home():
     return jsonify({
         "status": "running",
         "bot": "Telegram Shop Bot",
-        "version": "7.0",
+        "version": "8.0",
         "python": "3.9",
         "timestamp": datetime.now().isoformat()
     })
@@ -59,6 +54,7 @@ def init_db():
             value TEXT
         )
     """)
+    
     defaults = {
         "welcome_message": "🌟 Welcome to Premium Shop, {name}!",
         "currency": "💎 Credits",
@@ -73,6 +69,7 @@ def init_db():
         "scratch_enabled": "1",
         "scratch_rewards": "5,10,15,20,25",
     }
+    
     for key, val in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
 
@@ -245,14 +242,13 @@ def add_user(user_id, username, full_name, referrer_id=None):
     conn.close()
 
 # ---------- Conversation States ----------
-(CATEGORY_NAME, CATEGORY_EDIT, PRODUCT_NAME, PRODUCT_DESC, 
- PRODUCT_PRICE, PRODUCT_TYPE, PRODUCT_CONTENT, PRODUCT_STOCK,
- PRODUCT_EDIT_FIELD, PRODUCT_EDIT_VALUE,
+(CAPTCHA, ADDRESS, PROMO_CODE, 
+ CATEGORY_NAME, CATEGORY_EDIT, 
+ PRODUCT_NAME, PRODUCT_DESC, PRODUCT_PRICE, PRODUCT_TYPE, PRODUCT_CONTENT, PRODUCT_STOCK,
  USER_SEARCH, BALANCE_CHANGE,
  SETTING_VALUE,
  TASK_DESC, TASK_LINK, TASK_REWARD,
- PROMO_CODE, PROMO_REWARD, PROMO_LIMIT,
- CAPTCHA, ADDRESS) = range(20)
+ PROMO_REWARD, PROMO_LIMIT) = range(18)
 
 # ---------- Emoji Captcha ----------
 EMOJI_LIST = ["😀", "😂", "😍", "🥺", "😎", "🎉", "🔥", "⭐", "🐶", "🐱", "🐼"]
@@ -311,15 +307,6 @@ def start(update: Update, context: CallbackContext):
             referrer_id = ref
 
     add_user(user.id, user.username, user.full_name, referrer_id)
-
-    # Force join check
-    channel = get_setting("channel_force_join")
-    if channel:
-        try:
-            # Can't check membership without bot in channel, skip for simplicity
-            pass
-        except:
-            pass
 
     if get_setting("captcha_enabled") == "1":
         q, a = generate_emoji_captcha()
@@ -483,14 +470,12 @@ def tasks_list(update: Update, context: CallbackContext):
         return
     
     text = "📋 **Tasks:**\n"
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"✅ Complete #{t['id']}", callback_data=f"do_task_{t['id']}")]
-        for t in tasks
-    ])
+    kb = []
     for t in tasks:
         text += f"\n🔹 {t['description']} – {t['reward']} Credits"
+        kb.append([InlineKeyboardButton(f"✅ Complete #{t['id']}", callback_data=f"do_task_{t['id']}")])
     
-    update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
 def do_task_cb(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -675,9 +660,7 @@ def buy_cb(update: Update, context: CallbackContext):
         query.message.reply_text("📦 **Enter shipping address:**")
         return ADDRESS
     
-    process_purchase(user_id, prod, query.message, query.from_user, context)
-
-def process_purchase(user_id, prod, msg, user_data, context, address=""):
+    # Process digital/file purchase
     new_balance = user['balance'] - prod['price']
     new_stock = prod['stock'] - 1 if prod['stock'] != -1 else -1
     
@@ -686,12 +669,12 @@ def process_purchase(user_id, prod, msg, user_data, context, address=""):
     c.execute("UPDATE users SET balance=?, total_spent=total_spent+? WHERE user_id=?", 
               (new_balance, prod['price'], user_id))
     if new_stock != -1:
-        c.execute("UPDATE products SET stock=? WHERE id=?", (new_stock, prod['id']))
+        c.execute("UPDATE products SET stock=? WHERE id=?", (new_stock, prod_id))
     
     status = "delivered" if prod['type'] in ('digital','file') else "pending"
-    data = prod['content'] if status == "delivered" else address
+    data = prod['content'] if status == "delivered" else ""
     c.execute("INSERT INTO orders (user_id,product_id,status,data) VALUES (?,?,?,?)",
-              (user_id, prod['id'], status, data))
+              (user_id, prod_id, status, data))
     c.execute("INSERT INTO transactions (user_id,amount,type,description) VALUES (?,?,'purchase',?)",
               (user_id, -prod['price'], f"Bought {prod['name']}"))
     conn.commit()
@@ -706,6 +689,8 @@ def process_purchase(user_id, prod, msg, user_data, context, address=""):
             context.bot.send_message(user_id, "❌ File delivery failed")
     elif prod['type'] == 'digital':
         context.bot.send_message(user_id, f"📦 **Your item:**\n`{prod['content']}`", parse_mode=ParseMode.MARKDOWN)
+    
+    return ConversationHandler.END
 
 def address_handler(update: Update, context: CallbackContext):
     addr = update.message.text
@@ -720,7 +705,24 @@ def address_handler(update: Update, context: CallbackContext):
     user = c.fetchone()
     conn.close()
     
-    process_purchase(update.effective_user.id, prod, update.message, update.effective_user, context, addr)
+    new_balance = user['balance'] - prod['price']
+    new_stock = prod['stock'] - 1 if prod['stock'] != -1 else -1
+    
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance=?, total_spent=total_spent+? WHERE user_id=?", 
+              (new_balance, prod['price'], update.effective_user.id))
+    if new_stock != -1:
+        c.execute("UPDATE products SET stock=? WHERE id=?", (new_stock, prod_id))
+    
+    c.execute("INSERT INTO orders (user_id,product_id,status,data) VALUES (?,?,?,?)",
+              (update.effective_user.id, prod_id, 'pending', addr))
+    c.execute("INSERT INTO transactions (user_id,amount,type,description) VALUES (?,?,'purchase',?)",
+              (update.effective_user.id, -prod['price'], f"Bought {prod['name']}"))
+    conn.commit()
+    conn.close()
+    
+    update.message.reply_text(f"✅ **Order placed!** Balance: {new_balance} Credits\nAdmin will review your order.", parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END
 
 def my_orders_cb(update: Update, context: CallbackContext):
@@ -744,6 +746,15 @@ def my_orders_cb(update: Update, context: CallbackContext):
         text += f"\n🔹 {o['name']} – {o['status'].upper()}"
     
     query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+
+# ---------- Support & Rules ----------
+def support(update: Update, context: CallbackContext):
+    link = get_setting("support_link")
+    update.message.reply_text(f"ℹ️ **Contact Support:** {link}", parse_mode=ParseMode.MARKDOWN)
+
+def rules(update: Update, context: CallbackContext):
+    rules_text = get_setting("rules")
+    update.message.reply_text(rules_text, parse_mode=ParseMode.MARKDOWN)
 
 # ---------- Admin Panel ----------
 @admin_only
@@ -980,7 +991,7 @@ def admin_edit_prod_cb(update: Update, context: CallbackContext):
     ])
     
     query.message.reply_text("✏️ **Edit field:**", reply_markup=kb)
-    return PRODUCT_EDIT_FIELD
+    return PRODUCT_TYPE
 
 def admin_edit_field_cb(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -988,7 +999,7 @@ def admin_edit_field_cb(update: Update, context: CallbackContext):
     field = query.data.replace("edit_", "")
     context.user_data['edit_field'] = field
     query.message.reply_text(f"✏️ **New value for {field}:**")
-    return PRODUCT_EDIT_VALUE
+    return PRODUCT_NAME
 
 def admin_update_product(update: Update, context: CallbackContext):
     value = update.message.text
@@ -1000,7 +1011,7 @@ def admin_update_product(update: Update, context: CallbackContext):
             value = float(value) if field=='price' else int(value)
         except:
             update.message.reply_text("❌ Invalid number")
-            return PRODUCT_EDIT_VALUE
+            return PRODUCT_NAME
     
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -1392,15 +1403,6 @@ def back_to_cat_cb(update: Update, context: CallbackContext):
     
     query.edit_message_text("📦 **Products:**", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
-# ---------- Support & Rules ----------
-def support(update: Update, context: CallbackContext):
-    link = get_setting("support_link")
-    update.message.reply_text(f"ℹ️ **Contact Support:** {link}", parse_mode=ParseMode.MARKDOWN)
-
-def rules(update: Update, context: CallbackContext):
-    rules_text = get_setting("rules")
-    update.message.reply_text(rules_text, parse_mode=ParseMode.MARKDOWN)
-
 # ---------- Cancel ----------
 def cancel(update: Update, context: CallbackContext):
     update.message.reply_text("❌ Cancelled")
@@ -1418,49 +1420,38 @@ def main():
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
     
-    # Conversation handlers
+    # Conversation Handlers
     start_conv = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
-        states={
-            CAPTCHA: [MessageHandler(Filters.text & ~Filters.command, captcha_handler)]
-        },
+        states={CAPTCHA: [MessageHandler(Filters.text & ~Filters.command, captcha_handler)]},
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     
     promo_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(promo_ask, pattern='^redeem_promo$')],
-        states={
-            PROMO_CODE: [MessageHandler(Filters.text & ~Filters.command, promo_redeem)]
-        },
+        states={PROMO_CODE: [MessageHandler(Filters.text & ~Filters.command, promo_redeem)]},
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     
     address_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(buy_cb, pattern='^buy_')],
-        states={
-            ADDRESS: [MessageHandler(Filters.text & ~Filters.command, address_handler)]
-        },
+        states={ADDRESS: [MessageHandler(Filters.text & ~Filters.command, address_handler)]},
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     
-    # Admin category conversation
+    # Admin conversations
     admin_cat_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_add_cat_cb, pattern='^admin_add_cat$')],
-        states={
-            CATEGORY_NAME: [MessageHandler(Filters.text & ~Filters.command, add_category)]
-        },
+        states={CATEGORY_NAME: [MessageHandler(Filters.text & ~Filters.command, add_category)]},
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     
     admin_edit_cat_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_edit_cat_cb, pattern='^admin_edit_cat_')],
-        states={
-            CATEGORY_EDIT: [MessageHandler(Filters.text & ~Filters.command, edit_category)]
-        },
+        states={CATEGORY_EDIT: [MessageHandler(Filters.text & ~Filters.command, edit_category)]},
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     
-    # Admin product conversation
     admin_prod_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_add_prod_cb, pattern='^admin_add_prod_cat_')],
         states={
@@ -1477,39 +1468,30 @@ def main():
     admin_edit_prod_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_edit_prod_cb, pattern='^admin_edit_prod_')],
         states={
-            PRODUCT_EDIT_FIELD: [CallbackQueryHandler(admin_edit_field_cb, pattern='^edit_')],
-            PRODUCT_EDIT_VALUE: [MessageHandler(Filters.text & ~Filters.command, admin_update_product)],
+            PRODUCT_TYPE: [CallbackQueryHandler(admin_edit_field_cb, pattern='^edit_')],
+            PRODUCT_NAME: [MessageHandler(Filters.text & ~Filters.command, admin_update_product)],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     
-    # Admin user conversation
     admin_user_search_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_search_cb, pattern='^admin_search_user$')],
-        states={
-            USER_SEARCH: [MessageHandler(Filters.text & ~Filters.command, admin_show_user)]
-        },
+        states={USER_SEARCH: [MessageHandler(Filters.text & ~Filters.command, admin_show_user)]},
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     
     admin_balance_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_give_bal_cb, pattern='^admin_give_bal_')],
-        states={
-            BALANCE_CHANGE: [MessageHandler(Filters.text & ~Filters.command, admin_update_balance)]
-        },
+        states={BALANCE_CHANGE: [MessageHandler(Filters.text & ~Filters.command, admin_update_balance)]},
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     
-    # Admin setting conversation
     admin_setting_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_setting_cb, pattern='^set_')],
-        states={
-            SETTING_VALUE: [MessageHandler(Filters.text & ~Filters.command, admin_save_setting)]
-        },
+        states={SETTING_VALUE: [MessageHandler(Filters.text & ~Filters.command, admin_save_setting)]},
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     
-    # Admin promo conversation
     admin_promo_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_create_promo_cb, pattern='^admin_create_promo$')],
         states={
@@ -1520,7 +1502,6 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     
-    # Admin task conversation
     admin_task_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_create_task_cb, pattern='^admin_create_task$')],
         states={
@@ -1535,7 +1516,6 @@ def main():
     dp.add_handler(start_conv)
     dp.add_handler(promo_conv)
     dp.add_handler(address_conv)
-    
     dp.add_handler(admin_cat_conv)
     dp.add_handler(admin_edit_cat_conv)
     dp.add_handler(admin_prod_conv)
@@ -1592,5 +1572,6 @@ def main():
     updater.idle()
 
 if __name__ == "__main__":
+    import logging
     logging.basicConfig(level=logging.INFO)
     main()
