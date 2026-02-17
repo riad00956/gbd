@@ -4,6 +4,7 @@ import random
 import threading
 import logging
 import re
+import traceback
 from datetime import datetime
 from functools import wraps
 from flask import Flask, jsonify
@@ -345,28 +346,34 @@ def profile_handler(message):
 
 @bot.callback_query_handler(func=lambda call: call.data == "my_txs")
 def my_transactions(call):
-    user_id = call.from_user.id
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM transactions WHERE user_id = ? ORDER BY timestamp DESC LIMIT 10", (user_id,))
-    rows = c.fetchall()
-    conn.close()
-    if not rows:
-        bot.send_message(call.message.chat.id, "No transactions yet.")
-        return
-    text = "📜 *Last 10 Transactions*\n\n"
-    for r in rows:
-        sign = "+" if r['amount'] > 0 else ""
-        text += f"{r['timestamp'][:10]} {r['type']}: {sign}{r['amount']} - {r['description']}\n"
-    bot.send_message(call.message.chat.id, text)
-    bot.answer_callback_query(call.id)
+    try:
+        user_id = call.from_user.id
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM transactions WHERE user_id = ? ORDER BY timestamp DESC LIMIT 10", (user_id,))
+        rows = c.fetchall()
+        conn.close()
+        if not rows:
+            bot.send_message(call.message.chat.id, "No transactions yet.")
+            return
+        text = "📜 *Last 10 Transactions*\n\n"
+        for r in rows:
+            sign = "+" if r['amount'] > 0 else ""
+            text += f"{r['timestamp'][:10]} {r['type']}: {sign}{r['amount']} - {r['description']}\n"
+        bot.send_message(call.message.chat.id, text)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "redeem_promo")
 def redeem_promo_start(call):
-    msg = bot.send_message(call.message.chat.id, "🎟️ Send me the promo code:")
-    bot.register_next_step_handler(msg, process_redeem_promo)
-    bot.answer_callback_query(call.id)
+    try:
+        msg = bot.send_message(call.message.chat.id, "🎟️ Send me the promo code:")
+        bot.register_next_step_handler(msg, process_redeem_promo)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 def process_redeem_promo(message):
     code = message.text.strip().upper()
@@ -408,111 +415,123 @@ def process_redeem_promo(message):
 @bot.message_handler(func=lambda m: m.text == "🎁 Daily Bonus")
 @force_join_required
 def daily_bonus(message):
-    if get_setting("daily_enabled") == "0":
-        bot.reply_to(message, "Daily bonus is currently disabled.")
-        return
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    if not user:
-        bot.reply_to(message, "Please /start first.")
-        return
-    now = datetime.now()
-    if user['last_daily_claim']:
-        last = datetime.fromisoformat(user['last_daily_claim'])
-        if (now - last).total_seconds() < 86400:
-            bot.reply_to(message, "❌ You already claimed today. Come back later!")
+    try:
+        if get_setting("daily_enabled") == "0":
+            bot.reply_to(message, "Daily bonus is currently disabled.")
             return
-    reward = float(get_setting("daily_reward"))
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("UPDATE users SET balance = balance + ?, last_daily_claim = ? WHERE user_id = ?",
-              (reward, now.isoformat(), user_id))
-    conn.commit()
-    conn.close()
-    add_transaction(user_id, reward, "credit", "Daily Bonus")
-    bot.reply_to(message, f"🎉 You received {reward} {get_currency()} as daily bonus!")
+        user_id = message.from_user.id
+        user = get_user(user_id)
+        if not user:
+            bot.reply_to(message, "Please /start first.")
+            return
+        now = datetime.now()
+        if user['last_daily_claim']:
+            last = datetime.fromisoformat(user['last_daily_claim'])
+            if (now - last).total_seconds() < 86400:
+                bot.reply_to(message, "❌ You already claimed today. Come back later!")
+                return
+        reward = float(get_setting("daily_reward"))
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = balance + ?, last_daily_claim = ? WHERE user_id = ?",
+                  (reward, now.isoformat(), user_id))
+        conn.commit()
+        conn.close()
+        add_transaction(user_id, reward, "credit", "Daily Bonus")
+        bot.reply_to(message, f"🎉 You received {reward} {get_currency()} as daily bonus!")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {str(e)}")
 
 # ---------- Scratch Card ----------
 @bot.message_handler(func=lambda m: m.text == "✨ Scratch Card")
 @force_join_required
 def scratch_card(message):
-    if get_setting("scratch_enabled") == "0":
-        bot.reply_to(message, "Scratch card is currently disabled.")
-        return
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    if not user:
-        bot.reply_to(message, "Please /start first.")
-        return
-    now = datetime.now()
-    if user['last_scratch_claim']:
-        last = datetime.fromisoformat(user['last_scratch_claim'])
-        if (now - last).total_seconds() < 86400:
-            bot.reply_to(message, "❌ You already scratched a card today!")
+    try:
+        if get_setting("scratch_enabled") == "0":
+            bot.reply_to(message, "Scratch card is currently disabled.")
             return
-    rewards = [float(x) for x in get_setting("scratch_rewards").split(",")]
-    win = random.choice(rewards)
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("UPDATE users SET balance = balance + ?, last_scratch_claim = ? WHERE user_id = ?",
-              (win, now.isoformat(), user_id))
-    conn.commit()
-    conn.close()
-    add_transaction(user_id, win, "credit", "Scratch Card Win")
-    bot.reply_to(message, f"✨ You scratched the card and won `{win:.2f}` {get_currency()}!")
+        user_id = message.from_user.id
+        user = get_user(user_id)
+        if not user:
+            bot.reply_to(message, "Please /start first.")
+            return
+        now = datetime.now()
+        if user['last_scratch_claim']:
+            last = datetime.fromisoformat(user['last_scratch_claim'])
+            if (now - last).total_seconds() < 86400:
+                bot.reply_to(message, "❌ You already scratched a card today!")
+                return
+        rewards = [float(x) for x in get_setting("scratch_rewards").split(",")]
+        win = random.choice(rewards)
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = balance + ?, last_scratch_claim = ? WHERE user_id = ?",
+                  (win, now.isoformat(), user_id))
+        conn.commit()
+        conn.close()
+        add_transaction(user_id, win, "credit", "Scratch Card Win")
+        bot.reply_to(message, f"✨ You scratched the card and won `{win:.2f}` {get_currency()}!")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {str(e)}")
 
 # ---------- Tasks ----------
 @bot.message_handler(func=lambda m: m.text == "📋 Tasks")
 @force_join_required
 def list_tasks(message):
-    user_id = message.from_user.id
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM tasks")
-    tasks = c.fetchall()
-    if not tasks:
-        bot.reply_to(message, "No tasks available at the moment.")
+    try:
+        user_id = message.from_user.id
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks")
+        tasks = c.fetchall()
+        if not tasks:
+            bot.reply_to(message, "No tasks available at the moment.")
+            conn.close()
+            return
+        c.execute("SELECT task_id FROM completed_tasks WHERE user_id = ?", (user_id,))
+        completed = {row[0] for row in c.fetchall()}
         conn.close()
-        return
-    c.execute("SELECT task_id FROM completed_tasks WHERE user_id = ?", (user_id,))
-    completed = {row[0] for row in c.fetchall()}
-    conn.close()
 
-    markup = InlineKeyboardMarkup()
-    for task in tasks:
-        if task['id'] not in completed:
-            markup.add(InlineKeyboardButton(f"✅ {task['description']} (+{task['reward']})", callback_data=f"task_{task['id']}"))
-    if not markup.keyboard:
-        bot.send_message(message.chat.id, "You have completed all tasks! Check back later.")
-        return
-    bot.send_message(message.chat.id, "📋 *Available Tasks*\nClick a task to complete it:", reply_markup=markup)
+        markup = InlineKeyboardMarkup()
+        for task in tasks:
+            if task['id'] not in completed:
+                markup.add(InlineKeyboardButton(f"✅ {task['description']} (+{task['reward']})", callback_data=f"task_{task['id']}"))
+        if not markup.keyboard:
+            bot.send_message(message.chat.id, "You have completed all tasks! Check back later.")
+            return
+        bot.send_message(message.chat.id, "📋 *Available Tasks*\nClick a task to complete it:", reply_markup=markup)
+    except Exception as e:
+        bot.reply_to(message, f"Error: {str(e)}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("task_"))
 def task_callback(call):
-    task_id = int(call.data.split("_")[1])
-    user_id = call.from_user.id
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
-    task = c.fetchone()
-    if not task:
-        bot.answer_callback_query(call.id, "Task not found.")
+    try:
+        task_id = int(call.data.split("_")[1])
+        user_id = call.from_user.id
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        task = c.fetchone()
+        if not task:
+            bot.answer_callback_query(call.id, "Task not found.")
+            conn.close()
+            return
+        c.execute("SELECT * FROM completed_tasks WHERE user_id = ? AND task_id = ?", (user_id, task_id))
+        if c.fetchone():
+            bot.answer_callback_query(call.id, "You already completed this task.")
+            conn.close()
+            return
+        c.execute("INSERT INTO completed_tasks (user_id, task_id) VALUES (?, ?)", (user_id, task_id))
+        c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (task['reward'], user_id))
+        conn.commit()
+        add_transaction(user_id, task['reward'], "credit", f"Task: {task['description']}")
+        bot.answer_callback_query(call.id, f"✅ Task completed! You earned {task['reward']} {get_currency()}.")
+        bot.send_message(call.message.chat.id, f"🎉 You completed: {task['description']}\n💰 Reward: {task['reward']} {get_currency()}")
         conn.close()
-        return
-    c.execute("SELECT * FROM completed_tasks WHERE user_id = ? AND task_id = ?", (user_id, task_id))
-    if c.fetchone():
-        bot.answer_callback_query(call.id, "You already completed this task.")
-        conn.close()
-        return
-    c.execute("INSERT INTO completed_tasks (user_id, task_id) VALUES (?, ?)", (user_id, task_id))
-    c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (task['reward'], user_id))
-    conn.commit()
-    add_transaction(user_id, task['reward'], "credit", f"Task: {task['description']}")
-    bot.answer_callback_query(call.id, f"✅ Task completed! You earned {task['reward']} {get_currency()}.")
-    bot.send_message(call.message.chat.id, f"🎉 You completed: {task['description']}\n💰 Reward: {task['reward']} {get_currency()}")
-    conn.close()
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 # ---------- Support & Rules ----------
 @bot.message_handler(func=lambda m: m.text == "ℹ️ Support")
@@ -529,128 +548,144 @@ def rules(message):
 @bot.message_handler(func=lambda m: m.text == "🛍️ Shop")
 @force_join_required
 def shop_entry(message):
-    if get_setting("shop_enabled") == "0":
-        bot.reply_to(message, "⚠️ Shop is currently disabled.")
-        return
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM categories")
-    cats = c.fetchall()
-    conn.close()
-    if not cats:
-        bot.reply_to(message, "No categories available.")
-        return
-    markup = InlineKeyboardMarkup(row_width=2)
-    for cat in cats:
-        markup.add(InlineKeyboardButton(cat['name'], callback_data=f"cat_{cat['id']}"))
-    bot.send_message(message.chat.id, "📂 Select a category:", reply_markup=markup)
+    try:
+        if get_setting("shop_enabled") == "0":
+            bot.reply_to(message, "⚠️ Shop is currently disabled.")
+            return
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM categories")
+        cats = c.fetchall()
+        conn.close()
+        if not cats:
+            bot.reply_to(message, "No categories available.")
+            return
+        markup = InlineKeyboardMarkup(row_width=2)
+        for cat in cats:
+            markup.add(InlineKeyboardButton(cat['name'], callback_data=f"cat_{cat['id']}"))
+        bot.send_message(message.chat.id, "📂 Select a category:", reply_markup=markup)
+    except Exception as e:
+        bot.reply_to(message, f"Error: {str(e)}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cat_"))
 def show_products(call):
-    cat_id = int(call.data.split("_")[1])
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM products WHERE category_id = ?", (cat_id,))
-    prods = c.fetchall()
-    conn.close()
-    if not prods:
-        bot.answer_callback_query(call.id, "No products in this category.")
-        return
-    markup = InlineKeyboardMarkup(row_width=1)
-    curr = get_currency()
-    for p in prods:
-        stock = "∞" if p['stock'] == -1 else p['stock']
-        markup.add(InlineKeyboardButton(f"{p['name']} | {p['price']} {curr} | Stock: {stock}",
-                                         callback_data=f"prod_{p['id']}"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="shop_main"))
-    bot.edit_message_text("📦 Available Products:", call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    try:
+        cat_id = int(call.data.split("_")[1])
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM products WHERE category_id = ?", (cat_id,))
+        prods = c.fetchall()
+        conn.close()
+        if not prods:
+            bot.answer_callback_query(call.id, "No products in this category.")
+            return
+        markup = InlineKeyboardMarkup(row_width=1)
+        curr = get_currency()
+        for p in prods:
+            stock = "∞" if p['stock'] == -1 else p['stock']
+            markup.add(InlineKeyboardButton(f"{p['name']} | {p['price']} {curr} | Stock: {stock}",
+                                             callback_data=f"prod_{p['id']}"))
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data="shop_main"))
+        bot.edit_message_text("📦 Available Products:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("prod_"))
 def product_detail(call):
-    prod_id = int(call.data.split("_")[1])
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM products WHERE id = ?", (prod_id,))
-    p = c.fetchone()
-    conn.close()
-    if not p:
-        bot.answer_callback_query(call.id, "Product not found.")
-        return
-    curr = get_currency()
-    text = (f"📦 *{p['name']}*\n\n"
-            f"📝 {p['description']}\n\n"
-            f"💰 Price: `{p['price']} {curr}`\n"
-            f"📊 Stock: `{'Unlimited' if p['stock'] == -1 else p['stock']}`")
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🛒 Buy Now", callback_data=f"buy_{p['id']}"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"cat_{p['category_id']}"))
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    try:
+        prod_id = int(call.data.split("_")[1])
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM products WHERE id = ?", (prod_id,))
+        p = c.fetchone()
+        conn.close()
+        if not p:
+            bot.answer_callback_query(call.id, "Product not found.")
+            return
+        curr = get_currency()
+        text = (f"📦 *{p['name']}*\n\n"
+                f"📝 {p['description']}\n\n"
+                f"💰 Price: `{p['price']} {curr}`\n"
+                f"📊 Stock: `{'Unlimited' if p['stock'] == -1 else p['stock']}`")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🛒 Buy Now", callback_data=f"buy_{p['id']}"))
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"cat_{p['category_id']}"))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def buy_product(call):
-    prod_id = int(call.data.split("_")[1])
-    user_id = call.from_user.id
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM products WHERE id = ?", (prod_id,))
-    p = c.fetchone()
-    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    u = c.fetchone()
-    if not p or not u:
-        bot.answer_callback_query(call.id, "Error: product or user not found.")
+    try:
+        prod_id = int(call.data.split("_")[1])
+        user_id = call.from_user.id
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM products WHERE id = ?", (prod_id,))
+        p = c.fetchone()
+        c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        u = c.fetchone()
+        if not p or not u:
+            bot.answer_callback_query(call.id, "Error: product or user not found.")
+            conn.close()
+            return
+        if u['balance'] < p['price']:
+            bot.answer_callback_query(call.id, "❌ Insufficient points!", show_alert=True)
+            conn.close()
+            return
+        if p['stock'] != -1 and p['stock'] <= 0:
+            bot.answer_callback_query(call.id, "❌ Out of stock!", show_alert=True)
+            conn.close()
+            return
+
+        c.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id = ?",
+                  (p['price'], p['price'], user_id))
+        if p['stock'] != -1:
+            c.execute("UPDATE products SET stock = stock - 1 WHERE id = ?", (prod_id,))
+
+        if p['type'] == 'digital':
+            status = "delivered"
+            delivery_data = p['content']
+        elif p['type'] == 'file':
+            status = "delivered"
+            delivery_data = p['content']
+        else:
+            status = "pending"
+            delivery_data = "Manual fulfillment required"
+
+        c.execute("INSERT INTO orders (user_id, product_id, status, data) VALUES (?, ?, ?, ?)",
+                  (user_id, prod_id, status, delivery_data))
+        conn.commit()
+        add_transaction(user_id, -p['price'], "debit", f"Purchased {p['name']}")
+
+        # Send delivery
+        if p['type'] == 'digital':
+            bot.send_message(user_id, f"✅ Purchase Successful!\n\nYour item:\n`{delivery_data}`")
+        elif p['type'] == 'file':
+            try:
+                bot.send_document(user_id, delivery_data, caption=f"✅ Your purchased file: {p['name']}")
+            except Exception as file_err:
+                bot.send_message(user_id, f"✅ Purchase Successful! File ID: {delivery_data}\n(Error sending file: {file_err})")
+        else:
+            bot.send_message(user_id, "✅ Purchase Successful! Your order is pending admin approval. You'll receive it soon.")
         conn.close()
-        return
-    if u['balance'] < p['price']:
-        bot.answer_callback_query(call.id, "❌ Insufficient points!", show_alert=True)
-        conn.close()
-        return
-    if p['stock'] != -1 and p['stock'] <= 0:
-        bot.answer_callback_query(call.id, "❌ Out of stock!", show_alert=True)
-        conn.close()
-        return
-
-    c.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id = ?",
-              (p['price'], p['price'], user_id))
-    if p['stock'] != -1:
-        c.execute("UPDATE products SET stock = stock - 1 WHERE id = ?", (prod_id,))
-
-    if p['type'] == 'digital':
-        status = "delivered"
-        delivery_data = p['content']
-    elif p['type'] == 'file':
-        status = "delivered"
-        delivery_data = p['content']
-    else:
-        status = "pending"
-        delivery_data = "Manual fulfillment required"
-
-    c.execute("INSERT INTO orders (user_id, product_id, status, data) VALUES (?, ?, ?, ?)",
-              (user_id, prod_id, status, delivery_data))
-    conn.commit()
-    add_transaction(user_id, -p['price'], "debit", f"Purchased {p['name']}")
-
-    if p['type'] == 'digital':
-        bot.send_message(user_id, f"✅ Purchase Successful!\n\nYour item:\n`{delivery_data}`")
-    elif p['type'] == 'file':
-        try:
-            bot.send_document(user_id, delivery_data, caption=f"✅ Your purchased file: {p['name']}")
-        except:
-            bot.send_message(user_id, f"✅ Purchase Successful! File ID: {delivery_data}")
-    else:
-        bot.send_message(user_id, "✅ Purchase Successful! Your order is pending admin approval. You'll receive it soon.")
-    conn.close()
-    bot.answer_callback_query(call.id)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "shop_main")
 def shop_main(call):
-    shop_entry(call.message)
-    bot.answer_callback_query(call.id)
+    try:
+        shop_entry(call.message)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 # ---------- Admin Panel ----------
 @bot.message_handler(func=lambda m: m.text == "⚙️ Admin Panel")
@@ -658,7 +693,18 @@ def shop_main(call):
 def admin_panel(message):
     bot.send_message(message.chat.id, "🔧 *Welcome to Admin Control*", reply_markup=admin_panel_kb())
 
-# Debug command to check current welcome message
+# Debug commands
+@bot.message_handler(commands=['get_setting'])
+@admin_only
+def get_setting_command(message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /get_setting <key>")
+        return
+    key = parts[1]
+    value = get_setting(key)
+    bot.reply_to(message, f"`{key}` = `{value}`")
+
 @bot.message_handler(commands=['get_welcome'])
 @admin_only
 def get_welcome(message):
@@ -668,72 +714,84 @@ def get_welcome(message):
 @bot.callback_query_handler(func=lambda call: call.data == "admin_stats")
 @admin_only_callback
 def admin_stats(call):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM users")
-    user_count = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM orders")
-    order_count = c.fetchone()[0]
-    c.execute("SELECT SUM(total_spent) FROM users")
-    revenue = c.fetchone()[0] or 0
-    conn.close()
-    text = (f"📊 *Bot Statistics*\n\n"
-            f"👥 Total Users: `{user_count}`\n"
-            f"📦 Total Orders: `{order_count}`\n"
-            f"💰 Total Revenue: `{revenue:.2f} {get_currency()}`")
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=admin_panel_kb())
-    bot.answer_callback_query(call.id)
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        user_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM orders")
+        order_count = c.fetchone()[0]
+        c.execute("SELECT SUM(total_spent) FROM users")
+        revenue = c.fetchone()[0] or 0
+        conn.close()
+        text = (f"📊 *Bot Statistics*\n\n"
+                f"👥 Total Users: `{user_count}`\n"
+                f"📦 Total Orders: `{order_count}`\n"
+                f"💰 Total Revenue: `{revenue:.2f} {get_currency()}`")
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=admin_panel_kb())
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_users")
 @admin_only_callback
 def admin_users(call):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT user_id, username, balance, banned FROM users LIMIT 10")
-    users = c.fetchall()
-    conn.close()
-    text = "👥 *Recent Users*\n\n"
-    for u in users:
-        status = "🔴 Banned" if u['banned'] else "🟢 Active"
-        text += f"🆔 {u['user_id']} | @{u['username']} | {u['balance']} {get_currency()} | {status}\n"
-    text += "\nUse /search <id> to find a specific user."
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=admin_panel_kb())
-    bot.answer_callback_query(call.id)
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT user_id, username, balance, banned FROM users LIMIT 10")
+        users = c.fetchall()
+        conn.close()
+        text = "👥 *Recent Users*\n\n"
+        for u in users:
+            status = "🔴 Banned" if u['banned'] else "🟢 Active"
+            text += f"🆔 {u['user_id']} | @{u['username']} | {u['balance']} {get_currency()} | {status}\n"
+        text += "\nUse /search <id> to find a specific user."
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=admin_panel_kb())
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.message_handler(commands=['search'])
 @admin_only
 def search_user(message):
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "Usage: /search <user_id>")
-        return
-    user_id = parts[1]
-    user = get_user(user_id)
-    if not user:
-        bot.reply_to(message, "User not found.")
-        return
-    curr = get_currency()
-    text = (f"👤 *User Details*\n"
-            f"ID: `{user['user_id']}`\n"
-            f"Username: @{user['username']}\n"
-            f"Name: {user['full_name']}\n"
-            f"Points: {user['balance']} {curr}\n"
-            f"Spent: {user['total_spent']} {curr}\n"
-            f"Banned: {user['banned']}\n"
-            f"Joined: {user['joined_at']}")
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("➕ Add Points", callback_data=f"addbal_{user_id}"))
-    markup.add(InlineKeyboardButton("🔨 Ban/Unban", callback_data=f"ban_{user_id}"))
-    bot.send_message(message.chat.id, text, reply_markup=markup)
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "Usage: /search <user_id>")
+            return
+        user_id = parts[1]
+        user = get_user(user_id)
+        if not user:
+            bot.reply_to(message, "User not found.")
+            return
+        curr = get_currency()
+        text = (f"👤 *User Details*\n"
+                f"ID: `{user['user_id']}`\n"
+                f"Username: @{user['username']}\n"
+                f"Name: {user['full_name']}\n"
+                f"Points: {user['balance']} {curr}\n"
+                f"Spent: {user['total_spent']} {curr}\n"
+                f"Banned: {user['banned']}\n"
+                f"Joined: {user['joined_at']}")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("➕ Add Points", callback_data=f"addbal_{user_id}"))
+        markup.add(InlineKeyboardButton("🔨 Ban/Unban", callback_data=f"ban_{user_id}"))
+        bot.send_message(message.chat.id, text, reply_markup=markup)
+    except Exception as e:
+        bot.reply_to(message, f"Error: {str(e)}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("addbal_"))
 @admin_only_callback
 def add_balance_start(call):
-    user_id = call.data.split("_")[1]
-    msg = bot.send_message(call.message.chat.id, f"Enter amount to add to user {user_id}:")
-    bot.register_next_step_handler(msg, process_add_balance, user_id)
-    bot.answer_callback_query(call.id)
+    try:
+        user_id = call.data.split("_")[1]
+        msg = bot.send_message(call.message.chat.id, f"Enter amount to add to user {user_id}:")
+        bot.register_next_step_handler(msg, process_add_balance, user_id)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 def process_add_balance(message, target_id):
     try:
@@ -752,25 +810,31 @@ def process_add_balance(message, target_id):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("ban_"))
 @admin_only_callback
 def toggle_ban(call):
-    user_id = int(call.data.split("_")[1])
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT banned FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    if row:
-        new_status = 0 if row[0] else 1
-        c.execute("UPDATE users SET banned = ? WHERE user_id = ?", (new_status, user_id))
-        conn.commit()
-        bot.answer_callback_query(call.id, f"User {'banned' if new_status else 'unbanned'}.")
-    conn.close()
+    try:
+        user_id = int(call.data.split("_")[1])
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT banned FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        if row:
+            new_status = 0 if row[0] else 1
+            c.execute("UPDATE users SET banned = ? WHERE user_id = ?", (new_status, user_id))
+            conn.commit()
+            bot.answer_callback_query(call.id, f"User {'banned' if new_status else 'unbanned'}.")
+        conn.close()
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 # --- Broadcast ---
 @bot.callback_query_handler(func=lambda call: call.data == "admin_broadcast")
 @admin_only_callback
 def broadcast_start(call):
-    msg = bot.send_message(call.message.chat.id, "📢 Send the message (text/photo/video) you want to broadcast:")
-    bot.register_next_step_handler(msg, process_broadcast)
-    bot.answer_callback_query(call.id)
+    try:
+        msg = bot.send_message(call.message.chat.id, "📢 Send the message (text/photo/video) you want to broadcast:")
+        bot.register_next_step_handler(msg, process_broadcast)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 def process_broadcast(message):
     conn = sqlite3.connect(DB_NAME)
@@ -798,24 +862,30 @@ def process_broadcast(message):
 @bot.callback_query_handler(func=lambda call: call.data == "admin_shop")
 @admin_only_callback
 def admin_shop(call):
-    markup = InlineKeyboardMarkup(row_width=2)
-    buttons = [
-        InlineKeyboardButton("➕ Add Category", callback_data="add_cat"),
-        InlineKeyboardButton("➕ Add Product", callback_data="add_prod"),
-        InlineKeyboardButton("🗑 Delete Category", callback_data="del_cat_list"),
-        InlineKeyboardButton("🗑 Delete Product", callback_data="del_prod_list"),
-        InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
-    ]
-    markup.add(*buttons)
-    bot.edit_message_text("🛍 *Shop Management*", call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    try:
+        markup = InlineKeyboardMarkup(row_width=2)
+        buttons = [
+            InlineKeyboardButton("➕ Add Category", callback_data="add_cat"),
+            InlineKeyboardButton("➕ Add Product", callback_data="add_prod"),
+            InlineKeyboardButton("🗑 Delete Category", callback_data="del_cat_list"),
+            InlineKeyboardButton("🗑 Delete Product", callback_data="del_prod_list"),
+            InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
+        ]
+        markup.add(*buttons)
+        bot.edit_message_text("🛍 *Shop Management*", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "add_cat")
 @admin_only_callback
 def add_cat_start(call):
-    msg = bot.send_message(call.message.chat.id, "📝 Enter new category name:")
-    bot.register_next_step_handler(msg, add_cat_finish)
-    bot.answer_callback_query(call.id)
+    try:
+        msg = bot.send_message(call.message.chat.id, "📝 Enter new category name:")
+        bot.register_next_step_handler(msg, add_cat_finish)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 def add_cat_finish(message):
     name = message.text.strip()
@@ -832,75 +902,90 @@ def add_cat_finish(message):
 @bot.callback_query_handler(func=lambda call: call.data == "del_cat_list")
 @admin_only_callback
 def del_cat_list(call):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM categories")
-    cats = c.fetchall()
-    conn.close()
-    if not cats:
-        bot.answer_callback_query(call.id, "No categories.")
-        return
-    markup = InlineKeyboardMarkup()
-    for cat in cats:
-        markup.add(InlineKeyboardButton(f"❌ {cat['name']}", callback_data=f"delcat_{cat['id']}"))
-    bot.edit_message_text("Select category to delete:", call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM categories")
+        cats = c.fetchall()
+        conn.close()
+        if not cats:
+            bot.answer_callback_query(call.id, "No categories.")
+            return
+        markup = InlineKeyboardMarkup()
+        for cat in cats:
+            markup.add(InlineKeyboardButton(f"❌ {cat['name']}", callback_data=f"delcat_{cat['id']}"))
+        bot.edit_message_text("Select category to delete:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delcat_"))
 @admin_only_callback
 def delete_category(call):
-    cat_id = int(call.data.split("_")[1])
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
-    conn.commit()
-    conn.close()
-    bot.answer_callback_query(call.id, "Category deleted.")
-    del_cat_list(call)
+    try:
+        cat_id = int(call.data.split("_")[1])
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
+        conn.commit()
+        conn.close()
+        bot.answer_callback_query(call.id, "Category deleted.")
+        del_cat_list(call)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "add_prod")
 @admin_only_callback
 def add_prod_start(call):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM categories")
-    cats = c.fetchall()
-    conn.close()
-    if not cats:
-        bot.answer_callback_query(call.id, "No categories. Add one first.")
-        return
-    markup = InlineKeyboardMarkup()
-    for cat in cats:
-        markup.add(InlineKeyboardButton(cat['name'], callback_data=f"selcat_{cat['id']}"))
-    bot.edit_message_text("Select category for the new product:", call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM categories")
+        cats = c.fetchall()
+        conn.close()
+        if not cats:
+            bot.answer_callback_query(call.id, "No categories. Add one first.")
+            return
+        markup = InlineKeyboardMarkup()
+        for cat in cats:
+            markup.add(InlineKeyboardButton(cat['name'], callback_data=f"selcat_{cat['id']}"))
+        bot.edit_message_text("Select category for the new product:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("selcat_"))
 @admin_only_callback
 def add_prod_category(call):
-    cat_id = int(call.data.split("_")[1])
-    user_id = call.from_user.id
-    temp_data[user_id] = {'cat_id': cat_id}
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("Digital", callback_data="prodtype_digital"))
-    markup.add(InlineKeyboardButton("File", callback_data="prodtype_file"))
-    markup.add(InlineKeyboardButton("Manual", callback_data="prodtype_manual"))
-    bot.edit_message_text("Select product type:", call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    try:
+        cat_id = int(call.data.split("_")[1])
+        user_id = call.from_user.id
+        temp_data[user_id] = {'cat_id': cat_id}
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("Digital", callback_data="prodtype_digital"))
+        markup.add(InlineKeyboardButton("File", callback_data="prodtype_file"))
+        markup.add(InlineKeyboardButton("Manual", callback_data="prodtype_manual"))
+        bot.edit_message_text("Select product type:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("prodtype_"))
 @admin_only_callback
 def add_prod_type(call):
-    prod_type = call.data.split("_")[1]
-    user_id = call.from_user.id
-    if user_id not in temp_data:
-        temp_data[user_id] = {}
-    temp_data[user_id]['type'] = prod_type
-    msg = bot.send_message(call.message.chat.id, "Enter product name:")
-    bot.register_next_step_handler(msg, add_prod_name)
-    bot.answer_callback_query(call.id)
+    try:
+        prod_type = call.data.split("_")[1]
+        user_id = call.from_user.id
+        if user_id not in temp_data:
+            temp_data[user_id] = {}
+        temp_data[user_id]['type'] = prod_type
+        msg = bot.send_message(call.message.chat.id, "Enter product name:")
+        bot.register_next_step_handler(msg, add_prod_name)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 def add_prod_name(message):
     user_id = message.from_user.id
@@ -983,95 +1068,110 @@ def add_prod_content(message):
 @bot.callback_query_handler(func=lambda call: call.data == "admin_orders")
 @admin_only_callback
 def admin_orders(call):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY created_at DESC LIMIT 10")
-    orders = c.fetchall()
-    conn.close()
-    if not orders:
-        bot.edit_message_text("No pending orders.", call.message.chat.id, call.message.message_id, reply_markup=admin_panel_kb())
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY created_at DESC LIMIT 10")
+        orders = c.fetchall()
+        conn.close()
+        if not orders:
+            bot.edit_message_text("No pending orders.", call.message.chat.id, call.message.message_id, reply_markup=admin_panel_kb())
+            bot.answer_callback_query(call.id)
+            return
+        text = "📦 *Pending Orders*\n\n"
+        markup = InlineKeyboardMarkup()
+        for o in orders:
+            text += f"Order #{o['id']} | User: {o['user_id']} | Product: {o['product_id']} | {o['created_at']}\n"
+            markup.add(InlineKeyboardButton(f"Order #{o['id']}", callback_data=f"order_{o['id']}"))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
         bot.answer_callback_query(call.id)
-        return
-    text = "📦 *Pending Orders*\n\n"
-    markup = InlineKeyboardMarkup()
-    for o in orders:
-        text += f"Order #{o['id']} | User: {o['user_id']} | Product: {o['product_id']} | {o['created_at']}\n"
-        markup.add(InlineKeyboardButton(f"Order #{o['id']}", callback_data=f"order_{o['id']}"))
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("order_"))
 @admin_only_callback
 def order_detail(call):
-    order_id = int(call.data.split("_")[1])
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
-    o = c.fetchone()
-    conn.close()
-    if not o:
-        bot.answer_callback_query(call.id, "Order not found.")
-        return
-    text = (f"📦 *Order #{o['id']}*\n"
-            f"User: {o['user_id']}\n"
-            f"Product: {o['product_id']}\n"
-            f"Status: {o['status']}\n"
-            f"Data: {o['data']}\n"
-            f"Created: {o['created_at']}")
-    markup = InlineKeyboardMarkup()
-    if o['status'] == 'pending':
-        markup.add(InlineKeyboardButton("✅ Mark Delivered", callback_data=f"markdelivered_{order_id}"))
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    try:
+        order_id = int(call.data.split("_")[1])
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
+        o = c.fetchone()
+        conn.close()
+        if not o:
+            bot.answer_callback_query(call.id, "Order not found.")
+            return
+        text = (f"📦 *Order #{o['id']}*\n"
+                f"User: {o['user_id']}\n"
+                f"Product: {o['product_id']}\n"
+                f"Status: {o['status']}\n"
+                f"Data: {o['data']}\n"
+                f"Created: {o['created_at']}")
+        markup = InlineKeyboardMarkup()
+        if o['status'] == 'pending':
+            markup.add(InlineKeyboardButton("✅ Mark Delivered", callback_data=f"markdelivered_{order_id}"))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("markdelivered_"))
 @admin_only_callback
 def mark_delivered(call):
-    order_id = int(call.data.split("_")[1])
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("UPDATE orders SET status='delivered' WHERE id=?", (order_id,))
-    conn.commit()
-    conn.close()
-    bot.answer_callback_query(call.id, "Order marked delivered.")
-    order_detail(call)
+    try:
+        order_id = int(call.data.split("_")[1])
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("UPDATE orders SET status='delivered' WHERE id=?", (order_id,))
+        conn.commit()
+        conn.close()
+        bot.answer_callback_query(call.id, "Order marked delivered.")
+        order_detail(call)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 # --- Settings ---
 @bot.callback_query_handler(func=lambda call: call.data == "admin_settings")
 @admin_only_callback
 def admin_settings(call):
-    markup = InlineKeyboardMarkup(row_width=1)
-    settings = [
-        ("welcome_message", "Welcome Message"),
-        ("currency", "Currency Symbol"),
-        ("support_link", "Support Link"),
-        ("rules", "Rules"),
-        ("referral_reward", "Referral Reward"),
-        ("daily_reward", "Daily Reward"),
-        ("scratch_rewards", "Scratch Rewards (comma)")
-    ]
-    for key, label in settings:
-        markup.add(InlineKeyboardButton(f"✏️ {label}", callback_data=f"editset_{key}"))
-    markup.add(InlineKeyboardButton("🔁 Toggle Captcha", callback_data="toggle_captcha"))
-    markup.add(InlineKeyboardButton("🔁 Toggle Daily", callback_data="toggle_daily"))
-    markup.add(InlineKeyboardButton("🔁 Toggle Scratch", callback_data="toggle_scratch"))
-    markup.add(InlineKeyboardButton("🔁 Toggle Shop", callback_data="toggle_shop"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
-    bot.edit_message_text("⚙️ *Bot Settings*", call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    try:
+        markup = InlineKeyboardMarkup(row_width=1)
+        settings = [
+            ("welcome_message", "Welcome Message"),
+            ("currency", "Currency Symbol"),
+            ("support_link", "Support Link"),
+            ("rules", "Rules"),
+            ("referral_reward", "Referral Reward"),
+            ("daily_reward", "Daily Reward"),
+            ("scratch_rewards", "Scratch Rewards (comma)")
+        ]
+        for key, label in settings:
+            markup.add(InlineKeyboardButton(f"✏️ {label}", callback_data=f"editset_{key}"))
+        markup.add(InlineKeyboardButton("🔁 Toggle Captcha", callback_data="toggle_captcha"))
+        markup.add(InlineKeyboardButton("🔁 Toggle Daily", callback_data="toggle_daily"))
+        markup.add(InlineKeyboardButton("🔁 Toggle Scratch", callback_data="toggle_scratch"))
+        markup.add(InlineKeyboardButton("🔁 Toggle Shop", callback_data="toggle_shop"))
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
+        bot.edit_message_text("⚙️ *Bot Settings*", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("editset_"))
 @admin_only_callback
 def edit_setting_start(call):
-    key = call.data.split("_")[1]
-    user_id = call.from_user.id
-    temp_data[user_id] = {'edit_key': key}
-    current = get_setting(key)
-    msg = bot.send_message(call.message.chat.id, f"Current value: `{current}`\n\nSend new value:")
-    bot.register_next_step_handler(msg, edit_setting_finish)
-    bot.answer_callback_query(call.id)
+    try:
+        key = call.data.split("_")[1]
+        user_id = call.from_user.id
+        temp_data[user_id] = {'edit_key': key}
+        current = get_setting(key)
+        msg = bot.send_message(call.message.chat.id, f"Current value: `{current}`\n\nSend new value:")
+        bot.register_next_step_handler(msg, edit_setting_finish)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 def edit_setting_finish(message):
     user_id = message.from_user.id
@@ -1087,52 +1187,70 @@ def edit_setting_finish(message):
 @bot.callback_query_handler(func=lambda call: call.data == "toggle_captcha")
 @admin_only_callback
 def toggle_captcha(call):
-    current = get_setting("captcha_enabled")
-    new = "0" if current == "1" else "1"
-    update_setting("captcha_enabled", new)
-    bot.answer_callback_query(call.id, f"Captcha {'disabled' if new=='0' else 'enabled'}.")
+    try:
+        current = get_setting("captcha_enabled")
+        new = "0" if current == "1" else "1"
+        update_setting("captcha_enabled", new)
+        bot.answer_callback_query(call.id, f"Captcha {'disabled' if new=='0' else 'enabled'}.")
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "toggle_daily")
 @admin_only_callback
 def toggle_daily(call):
-    current = get_setting("daily_enabled")
-    new = "0" if current == "1" else "1"
-    update_setting("daily_enabled", new)
-    bot.answer_callback_query(call.id, f"Daily bonus {'disabled' if new=='0' else 'enabled'}.")
+    try:
+        current = get_setting("daily_enabled")
+        new = "0" if current == "1" else "1"
+        update_setting("daily_enabled", new)
+        bot.answer_callback_query(call.id, f"Daily bonus {'disabled' if new=='0' else 'enabled'}.")
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "toggle_scratch")
 @admin_only_callback
 def toggle_scratch(call):
-    current = get_setting("scratch_enabled")
-    new = "0" if current == "1" else "1"
-    update_setting("scratch_enabled", new)
-    bot.answer_callback_query(call.id, f"Scratch card {'disabled' if new=='0' else 'enabled'}.")
+    try:
+        current = get_setting("scratch_enabled")
+        new = "0" if current == "1" else "1"
+        update_setting("scratch_enabled", new)
+        bot.answer_callback_query(call.id, f"Scratch card {'disabled' if new=='0' else 'enabled'}.")
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "toggle_shop")
 @admin_only_callback
 def toggle_shop(call):
-    current = get_setting("shop_enabled")
-    new = "0" if current == "1" else "1"
-    update_setting("shop_enabled", new)
-    bot.answer_callback_query(call.id, f"Shop {'disabled' if new=='0' else 'enabled'}.")
+    try:
+        current = get_setting("shop_enabled")
+        new = "0" if current == "1" else "1"
+        update_setting("shop_enabled", new)
+        bot.answer_callback_query(call.id, f"Shop {'disabled' if new=='0' else 'enabled'}.")
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 # --- Promos ---
 @bot.callback_query_handler(func=lambda call: call.data == "admin_promos")
 @admin_only_callback
 def admin_promos(call):
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("➕ Create Promo", callback_data="create_promo"))
-    markup.add(InlineKeyboardButton("📋 List Promos", callback_data="list_promos"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
-    bot.edit_message_text("🎁 *Promo Management*", call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    try:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("➕ Create Promo", callback_data="create_promo"))
+        markup.add(InlineKeyboardButton("📋 List Promos", callback_data="list_promos"))
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
+        bot.edit_message_text("🎁 *Promo Management*", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "create_promo")
 @admin_only_callback
 def create_promo_start(call):
-    msg = bot.send_message(call.message.chat.id, "Enter promo code (e.g., SUMMER20):")
-    bot.register_next_step_handler(msg, create_promo_code)
-    bot.answer_callback_query(call.id)
+    try:
+        msg = bot.send_message(call.message.chat.id, "Enter promo code (e.g., SUMMER20):")
+        bot.register_next_step_handler(msg, create_promo_code)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 def create_promo_code(message):
     code = message.text.strip().upper()
@@ -1196,38 +1314,47 @@ def create_promo_expiry(message):
 @bot.callback_query_handler(func=lambda call: call.data == "list_promos")
 @admin_only_callback
 def list_promos(call):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM promos")
-    promos = c.fetchall()
-    conn.close()
-    if not promos:
-        bot.answer_callback_query(call.id, "No promos.")
-        return
-    text = "🎟️ *Promo Codes*\n\n"
-    for p in promos:
-        text += f"Code: `{p['code']}` | Reward: {p['reward']} | Used: {p['used_count']}/{p['max_usage'] if p['max_usage']!=-1 else '∞'} | Expiry: {p['expiry_date'] or 'None'}\n"
-    bot.send_message(call.message.chat.id, text)
-    bot.answer_callback_query(call.id)
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM promos")
+        promos = c.fetchall()
+        conn.close()
+        if not promos:
+            bot.answer_callback_query(call.id, "No promos.")
+            return
+        text = "🎟️ *Promo Codes*\n\n"
+        for p in promos:
+            text += f"Code: `{p['code']}` | Reward: {p['reward']} | Used: {p['used_count']}/{p['max_usage'] if p['max_usage']!=-1 else '∞'} | Expiry: {p['expiry_date'] or 'None'}\n"
+        bot.send_message(call.message.chat.id, text)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 # --- Tasks Management ---
 @bot.callback_query_handler(func=lambda call: call.data == "admin_tasks")
 @admin_only_callback
 def admin_tasks(call):
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("➕ Add Task", callback_data="add_task"))
-    markup.add(InlineKeyboardButton("📋 List Tasks", callback_data="list_tasks_admin"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
-    bot.edit_message_text("📋 *Task Management*", call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    try:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("➕ Add Task", callback_data="add_task"))
+        markup.add(InlineKeyboardButton("📋 List Tasks", callback_data="list_tasks_admin"))
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
+        bot.edit_message_text("📋 *Task Management*", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "add_task")
 @admin_only_callback
 def add_task_start(call):
-    msg = bot.send_message(call.message.chat.id, "Enter task description:")
-    bot.register_next_step_handler(msg, add_task_desc)
-    bot.answer_callback_query(call.id)
+    try:
+        msg = bot.send_message(call.message.chat.id, "Enter task description:")
+        bot.register_next_step_handler(msg, add_task_desc)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 def add_task_desc(message):
     desc = message.text.strip()
@@ -1271,62 +1398,74 @@ def add_task_reward(message):
 @bot.callback_query_handler(func=lambda call: call.data == "list_tasks_admin")
 @admin_only_callback
 def list_tasks_admin(call):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM tasks")
-    tasks = c.fetchall()
-    conn.close()
-    if not tasks:
-        bot.answer_callback_query(call.id, "No tasks.")
-        return
-    text = "📋 *All Tasks*\n\n"
-    markup = InlineKeyboardMarkup()
-    for t in tasks:
-        text += f"ID {t['id']}: {t['description']} | Reward: {t['reward']}\n"
-        markup.add(InlineKeyboardButton(f"❌ Delete task {t['id']}", callback_data=f"deltask_{t['id']}"))
-    bot.send_message(call.message.chat.id, text, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks")
+        tasks = c.fetchall()
+        conn.close()
+        if not tasks:
+            bot.answer_callback_query(call.id, "No tasks.")
+            return
+        text = "📋 *All Tasks*\n\n"
+        markup = InlineKeyboardMarkup()
+        for t in tasks:
+            text += f"ID {t['id']}: {t['description']} | Reward: {t['reward']}\n"
+            markup.add(InlineKeyboardButton(f"❌ Delete task {t['id']}", callback_data=f"deltask_{t['id']}"))
+        bot.send_message(call.message.chat.id, text, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("deltask_"))
 @admin_only_callback
 def delete_task(call):
-    task_id = int(call.data.split("_")[1])
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-    conn.commit()
-    conn.close()
-    bot.answer_callback_query(call.id, "Task deleted.")
-    list_tasks_admin(call)
+    try:
+        task_id = int(call.data.split("_")[1])
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.commit()
+        conn.close()
+        bot.answer_callback_query(call.id, "Task deleted.")
+        list_tasks_admin(call)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 # --- Leaderboard ---
 @bot.callback_query_handler(func=lambda call: call.data == "admin_leaderboard")
 @admin_only_callback
 def admin_leaderboard(call):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT 10")
-    top = c.fetchall()
-    conn.close()
-    if not top:
-        bot.send_message(call.message.chat.id, "No users yet.")
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT 10")
+        top = c.fetchall()
+        conn.close()
+        if not top:
+            bot.send_message(call.message.chat.id, "No users yet.")
+            bot.answer_callback_query(call.id)
+            return
+        text = "🏆 *Top 10 Users by Points*\n\n"
+        for i, u in enumerate(top, 1):
+            text += f"{i}. {u['username'] or u['user_id']} – {u['balance']} {get_currency()}\n"
+        bot.send_message(call.message.chat.id, text)
         bot.answer_callback_query(call.id)
-        return
-    text = "🏆 *Top 10 Users by Points*\n\n"
-    for i, u in enumerate(top, 1):
-        text += f"{i}. {u['username'] or u['user_id']} – {u['balance']} {get_currency()}\n"
-    bot.send_message(call.message.chat.id, text)
-    bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 # --- Backup ---
 @bot.callback_query_handler(func=lambda call: call.data == "admin_backup")
 @admin_only_callback
 def admin_backup(call):
-    with open(DB_NAME, 'rb') as f:
-        bot.send_document(call.message.chat.id, f, caption=f"📅 Database backup {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    bot.answer_callback_query(call.id)
+    try:
+        with open(DB_NAME, 'rb') as f:
+            bot.send_document(call.message.chat.id, f, caption=f"📅 Database backup {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
 
 # --- Fallback to main menu for any text ---
 @bot.message_handler(func=lambda m: True)
